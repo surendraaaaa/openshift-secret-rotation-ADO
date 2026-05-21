@@ -1,6 +1,9 @@
 trigger: none
 pr: none
 
+pool:
+  vmImage: 'ubuntu-latest'
+
 parameters:
 - name: mode
   type: string
@@ -32,7 +35,7 @@ parameters:
   default: true
 
 variables:
-- group: openshift-secret-rotation-dummy
+- group: openshift-secret-rotation
 
 stages:
 - stage: Discover
