@@ -1,0 +1,184 @@
+trigger: none
+pr: none
+
+parameters:
+- name: mode
+  type: string
+  default: discover
+  values:
+  - discover
+  - update
+
+- name: secretName
+  type: string
+  default: gitconfig
+
+- name: secretKey
+  type: string
+  default: token
+
+- name: clusters
+  type: object
+  default:
+  - sandbox
+
+- name: targetProjects
+  type: object
+  default:
+  - surendra2410-dev
+
+- name: restartWorkloads
+  type: boolean
+  default: true
+
+variables:
+- group: openshift-secret-rotation-dummy
+
+stages:
+- stage: Discover
+  displayName: Discover secret usage
+  jobs:
+  - job: discover
+    displayName: Scan projects
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - bash: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y jq
+        curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz
+        tar -xzf oc.tar.gz
+        sudo mv oc /usr/local/bin/oc
+        chmod +x /usr/local/bin/oc
+        oc version --client
+        jq --version
+      displayName: Install oc and jq
+
+    - bash: |
+        set -euo pipefail
+        mkdir -p reports
+        chmod +x scripts/discover-secret-usage.sh
+        export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+        : > "$KUBECONFIG"
+
+        for cluster in ${{ join(' ', parameters.clusters) }}; do
+          api_var="OC_${cluster^^}_API"
+          token_var="OC_${cluster^^}_TOKEN"
+          api="${!api_var}"
+          token="${!token_var}"
+
+          if [ -z "${api:-}" ] || [ -z "${token:-}" ]; then
+            echo "Missing variables for $cluster: $api_var or $token_var" >&2
+            exit 1
+          fi
+
+          oc login "$api" --token="$token" --insecure-skip-tls-verify=true >/dev/null
+
+          ./scripts/discover-secret-usage.sh \
+            --cluster "$cluster" \
+            --secret-name "${{ parameters.secretName }}" \
+            --target-projects "${{ join(',', parameters.targetProjects) }}" \
+            --output "reports/${cluster}-secret-usage.csv"
+        done
+
+        awk 'FNR==1 && NR!=1 {next} {print}' reports/*-secret-usage.csv > reports/all-secret-usage.csv
+        cat reports/all-secret-usage.csv
+      displayName: Run discovery
+      env:
+        OC_SANDBOX_API: $(OC_SANDBOX_API)
+        OC_SANDBOX_TOKEN: $(OC_SANDBOX_TOKEN)
+
+    - publish: reports
+      artifact: secret-usage-report
+      displayName: Publish discovery report
+
+- stage: Approval
+  displayName: Approval gate
+  dependsOn: Discover
+  condition: and(succeeded(), eq('${{ parameters.mode }}', 'update'))
+  jobs:
+  - job: wait_for_approval
+    displayName: Manual approval
+    pool: server
+    timeoutInMinutes: 4320
+    steps:
+    - task: ManualValidation@1
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: 'your-email@example.com'
+        instructions: 'Review the secret-usage-report artifact. Approve only if the target namespaces and workloads are correct for dummy secret rotation testing.'
+        allowApproversToApproveTheirOwnRuns: true
+        onTimeout: reject
+
+- stage: Update
+  displayName: Update secret and restart workloads
+  dependsOn: Approval
+  condition: and(succeeded(), eq('${{ parameters.mode }}', 'update'))
+  jobs:
+  - job: update_secret
+    displayName: Update matching namespaces
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - download: current
+      artifact: secret-usage-report
+
+    - bash: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y jq
+        curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz
+        tar -xzf oc.tar.gz
+        sudo mv oc /usr/local/bin/oc
+        chmod +x /usr/local/bin/oc
+        oc version --client
+        jq --version
+      displayName: Install oc and jq
+
+    - bash: |
+        set -euo pipefail
+        chmod +x scripts/update-secret.sh scripts/restart-workloads.sh
+        export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+        : > "$KUBECONFIG"
+
+        for cluster in ${{ join(' ', parameters.clusters) }}; do
+          api_var="OC_${cluster^^}_API"
+          token_var="OC_${cluster^^}_TOKEN"
+          api="${!api_var}"
+          token="${!token_var}"
+
+          if [ -z "${api:-}" ] || [ -z "${token:-}" ]; then
+            echo "Missing variables for $cluster: $api_var or $token_var" >&2
+            exit 1
+          fi
+
+          oc login "$api" --token="$token" --insecure-skip-tls-verify=true >/dev/null
+
+          csv_path="$(Pipeline.Workspace)/secret-usage-report/${cluster}-secret-usage.csv"
+          [ -f "$csv_path" ] || continue
+
+          ./scripts/update-secret.sh \
+            --cluster "$cluster" \
+            --csv "$csv_path" \
+            --secret-name "${{ parameters.secretName }}" \
+            --secret-key "${{ parameters.secretKey }}" \
+            --new-value "$(GITCONFIG_NEW_VALUE)"
+
+          if [ "${{ parameters.restartWorkloads }}" = "true" ]; then
+            ./scripts/restart-workloads.sh \
+              --cluster "$cluster" \
+              --csv "$csv_path"
+          fi
+        done
+
+        oc -n surendra2410-dev get secret gitconfig -o jsonpath='{.data.token}' | base64 -d; echo
+      displayName: Update secret in matching projects
+      env:
+        GITCONFIG_NEW_VALUE: $(GITCONFIG_NEW_VALUE)
+        OC_SANDBOX_API: $(OC_SANDBOX_API)
+        OC_SANDBOX_TOKEN: $(OC_SANDBOX_TOKEN)
