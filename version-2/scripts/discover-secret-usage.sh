@@ -70,3 +70,20 @@ done
 sort -u "$OUTPUT" -o "$OUTPUT"
 { echo 'cluster,project,kind,workload,container_or_scope,usage'; tail -n +2 "$OUTPUT"; } > "$OUTPUT.tmp"
 mv "$OUTPUT.tmp" "$OUTPUT"
+
+# usage
+# oc login <venus-api> --token=<venus-token>
+# ./discover-secret-usage.sh --cluster venus --secret-name gitconfig --output venus-secret-usage.csv
+
+# oc login <water-api> --token=<water-token>
+# ./discover-secret-usage.sh --cluster water --secret-name gitconfig --output water-secret-usage.csv
+
+# oc login <saturn-api> --token=<saturn-token>
+# ./discover-secret-usage.sh --cluster saturn --secret-name gitconfig --output saturn-secret-usage.csv
+
+# If you want only some projects
+# ./discover-secret-usage.sh \
+#   --cluster venus \
+#   --secret-name gitconfig \
+#   --target-projects proj1,proj2,proj3 \
+#   --output venus-selected.csv
