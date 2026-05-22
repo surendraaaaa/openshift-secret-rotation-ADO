@@ -1,0 +1,223 @@
+trigger: none
+pr: none
+
+parameters:
+- name: mode
+  type: string
+  default: discover
+  values:
+  - discover
+  - update
+
+- name: secretName
+  type: string
+  default: gitconfig
+
+- name: secretKey
+  type: string
+  default: token
+
+- name: clusters
+  type: object
+  default:
+  - venus
+  - water
+  - saturn
+
+- name: targetProjectsCsv
+  type: string
+  default: ''
+
+- name: restartWorkloads
+  type: boolean
+  default: true
+
+- name: dryRun
+  type: boolean
+  default: true
+
+- name: onlyRestartEnvConsumers
+  type: boolean
+  default: false
+
+variables:
+- group: openshift-secret-rotation
+
+stages:
+- stage: Discover
+  displayName: Discover secret usage
+  jobs:
+  - job: discover
+    displayName: Scan clusters and projects
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - bash: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y jq
+        curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz
+        tar -xzf oc.tar.gz
+        sudo mv oc /usr/local/bin/oc
+        chmod +x /usr/local/bin/oc
+        oc version --client
+        jq --version
+      displayName: Install oc and jq
+
+    - bash: |
+        set -euo pipefail
+        mkdir -p reports
+        chmod +x scripts/discover-secret-usage.sh
+        export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+        : > "$KUBECONFIG"
+
+        for cluster in ${{ join(' ', parameters.clusters) }}; do
+          api_var="OC_${cluster^^}_API"
+          token_var="OC_${cluster^^}_TOKEN"
+          api="${!api_var}"
+          token="${!token_var}"
+
+          if [ -z "${api:-}" ] || [ -z "${token:-}" ]; then
+            echo "Missing pipeline variables for $cluster: $api_var or $token_var" >&2
+            exit 1
+          fi
+
+          oc login "$api" --token="$token" --insecure-skip-tls-verify=true >/dev/null
+
+          ./scripts/discover-secret-usage.sh \
+            --cluster "$cluster" \
+            --secret-name "${{ parameters.secretName }}" \
+            --target-projects "${{ parameters.targetProjectsCsv }}" \
+            --output "reports/${cluster}-secret-usage.csv"
+        done
+
+        awk 'FNR==1 && NR!=1 {next} {print}' reports/*-secret-usage.csv > reports/all-secret-usage.csv
+      displayName: Run discovery
+      env:
+        OC_VENUS_API: $(OC_VENUS_API)
+        OC_VENUS_TOKEN: $(OC_VENUS_TOKEN)
+        OC_WATER_API: $(OC_WATER_API)
+        OC_WATER_TOKEN: $(OC_WATER_TOKEN)
+        OC_SATURN_API: $(OC_SATURN_API)
+        OC_SATURN_TOKEN: $(OC_SATURN_TOKEN)
+
+    - publish: reports
+      artifact: secret-usage-report
+      displayName: Publish discovery report
+
+- stage: Approval
+  displayName: Approval gate
+  dependsOn: Discover
+  condition: and(succeeded(), eq('${{ parameters.mode }}', 'update'))
+  jobs:
+  - job: wait_for_approval
+    displayName: Manual approval
+    pool: server
+    timeoutInMinutes: 4320
+    steps:
+    - task: ManualValidation@1
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: 'your-team@example.com'
+        instructions: 'Review the secret-usage-report artifact. Approve only if the target namespaces and workloads for secret rotation are correct.'
+        allowApproversToApproveTheirOwnRuns: true
+        onTimeout: reject
+
+- stage: Update
+  displayName: Update secret and restart workloads
+  dependsOn: Approval
+  condition: and(succeeded(), eq('${{ parameters.mode }}', 'update'))
+  jobs:
+  - job: update_secret
+    displayName: Update matching namespaces
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - download: current
+      artifact: secret-usage-report
+
+    - bash: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y jq
+        curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz
+        tar -xzf oc.tar.gz
+        sudo mv oc /usr/local/bin/oc
+        chmod +x /usr/local/bin/oc
+        oc version --client
+        jq --version
+      displayName: Install oc and jq
+
+    - bash: |
+        set -euo pipefail
+        mkdir -p backups
+        chmod +x scripts/update-secret.sh scripts/restart-workloads.sh
+        export KUBECONFIG="$(Agent.TempDirectory)/kubeconfig"
+        : > "$KUBECONFIG"
+
+        for cluster in ${{ join(' ', parameters.clusters) }}; do
+          api_var="OC_${cluster^^}_API"
+          token_var="OC_${cluster^^}_TOKEN"
+          api="${!api_var}"
+          token="${!token_var}"
+
+          if [ -z "${api:-}" ] || [ -z "${token:-}" ]; then
+            echo "Missing pipeline variables for $cluster: $api_var or $token_var" >&2
+            exit 1
+          fi
+
+          oc login "$api" --token="$token" --insecure-skip-tls-verify=true >/dev/null
+
+          csv_path="$(Pipeline.Workspace)/secret-usage-report/${cluster}-secret-usage.csv"
+          [ -f "$csv_path" ] || continue
+
+          update_args=(
+            --cluster "$cluster"
+            --csv "$csv_path"
+            --secret-name "${{ parameters.secretName }}"
+            --secret-key "${{ parameters.secretKey }}"
+            --new-value "$(GITCONFIG_NEW_VALUE)"
+            --backup-dir "backups/$cluster"
+          )
+
+          if [ "${{ parameters.dryRun }}" = "true" ]; then
+            update_args+=(--dry-run)
+          fi
+
+          ./scripts/update-secret.sh "${update_args[@]}"
+
+          if [ "${{ parameters.restartWorkloads }}" = "true" ]; then
+            restart_args=(
+              --cluster "$cluster"
+              --csv "$csv_path"
+            )
+
+            if [ "${{ parameters.dryRun }}" = "true" ]; then
+              restart_args+=(--dry-run)
+            fi
+
+            if [ "${{ parameters.onlyRestartEnvConsumers }}" = "true" ]; then
+              restart_args+=(--only-env-consumers)
+            fi
+
+            ./scripts/restart-workloads.sh "${restart_args[@]}"
+          fi
+        done
+      displayName: Update secret in matching projects
+      env:
+        GITCONFIG_NEW_VALUE: $(GITCONFIG_NEW_VALUE)
+        OC_VENUS_API: $(OC_VENUS_API)
+        OC_VENUS_TOKEN: $(OC_VENUS_TOKEN)
+        OC_WATER_API: $(OC_WATER_API)
+        OC_WATER_TOKEN: $(OC_WATER_TOKEN)
+        OC_SATURN_API: $(OC_SATURN_API)
+        OC_SATURN_TOKEN: $(OC_SATURN_TOKEN)
+
+    - publish: backups
+      artifact: secret-backups
+      displayName: Publish secret backups
+      condition: always()
