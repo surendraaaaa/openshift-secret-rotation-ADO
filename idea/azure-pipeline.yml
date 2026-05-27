@@ -1,0 +1,188 @@
+ARGOCD_PR_CREATOR_TOKEN   → PAT of bmogc-Koch SA       🔒 secret
+ARGOCD_APPROVER_TOKEN     → PAT of dss-devops-argocd-approver  🔒 secret
+ARGOCD_REPO_OWNER         → BMO-Prod                   (not secret)
+ARGOCD_REPO_NAME          → your-argocd-repo-name      (not secret)
+
+pipeline_templates/
+└── utils/
+    └── argocd-auto-pr.yml      ← NEW FILE
+
+# ================================================================
+# Template : argocd-auto-pr.yml
+# Purpose  : Auto create, approve and merge ArgoCD config PR
+# Owner    : dss_devops_admins
+# Version  : 1.0.0
+# ================================================================
+
+parameters:
+  - name: argocdRepoOwner
+    type: string
+    default: 'BMO-Prod'
+
+  - name: argocdRepoName
+    type: string                     # e.g. dss-argocd-config
+
+  - name: headBranch
+    type: string                     # branch Ansible pushed to
+
+  - name: baseBranch
+    type: string
+    default: 'master'
+
+  - name: appName
+    type: string                     # e.g. channel-service-payments
+
+  - name: imageTag
+    type: string                     # IMAGE_TAG from OCP4_Deploy stage
+
+jobs:
+  - job: ArgoCD_Auto_PR
+    displayName: 'ArgoCD: Create → Approve → Merge PR'
+    pool:
+      name: $(agentPoolName)
+      demands:
+        - agent.os -equals Linux
+    variables:
+      - group: argocd-automation-secrets
+
+    steps:
+
+      # ── Step 1: Validate branch exists on remote ──────────────
+      - bash: |
+          set -e
+          echo "Checking branch: ${{ parameters.headBranch }}"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $(ARGOCD_PR_CREATOR_TOKEN)" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ parameters.argocdRepoOwner }}/${{ parameters.argocdRepoName }}/branches/${{ parameters.headBranch }}")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "##[error] Branch ${{ parameters.headBranch }} not found on remote. HTTP: $HTTP_CODE"
+            exit 1
+          fi
+          echo "✅ Branch verified"
+        displayName: 'Validate ArgoCD Branch Exists'
+        condition: succeeded()
+
+      # ── Step 2: Check if PR already exists (idempotency) ──────
+      - bash: |
+          set -e
+          EXISTING=$(curl -s \
+            -H "Authorization: Bearer $(ARGOCD_PR_CREATOR_TOKEN)" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ parameters.argocdRepoOwner }}/${{ parameters.argocdRepoName }}/pulls?head=${{ parameters.argocdRepoOwner }}:${{ parameters.headBranch }}&base=${{ parameters.baseBranch }}&state=open" \
+            | jq -r '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "PR already exists: #$EXISTING"
+            echo "##vso[task.setvariable variable=PR_NUMBER;isOutput=true]$EXISTING"
+            echo "##vso[task.setvariable variable=PR_ALREADY_EXISTED]true"
+          else
+            echo "##vso[task.setvariable variable=PR_ALREADY_EXISTED]false"
+          fi
+        displayName: 'Check Existing PR'
+        name: CheckPR
+        condition: succeeded()
+
+      # ── Step 3: Create PR (skip if already exists) ────────────
+      - bash: |
+          set -e
+          PR_TITLE="chore(${{ parameters.appName }}): deploy image ${{ parameters.imageTag }} [Build $(Build.BuildId)]"
+          PR_BODY="**Automated ArgoCD Config Update**\n\n- App: \`${{ parameters.appName }}\`\n- Image Tag: \`${{ parameters.imageTag }}\`\n- Build: [$(Build.BuildId)]($(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId))\n- Branch: \`${{ parameters.headBranch }}\`\n\n> Auto-raised by dss-devops pipeline. Do not edit manually."
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $(ARGOCD_PR_CREATOR_TOKEN)" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ parameters.argocdRepoOwner }}/${{ parameters.argocdRepoName }}/pulls" \
+            -d "{\"title\":\"$PR_TITLE\",\"body\":\"$PR_BODY\",\"head\":\"${{ parameters.headBranch }}\",\"base\":\"${{ parameters.baseBranch }}\"}")
+
+          PR_NUMBER=$(echo "$RESPONSE" | jq -r '.number')
+          PR_URL=$(echo "$RESPONSE" | jq -r '.html_url')
+
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" == "null" ]; then
+            echo "##[error] PR creation failed. Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "✅ PR #$PR_NUMBER created: $PR_URL"
+          echo "##vso[task.setvariable variable=PR_NUMBER;isOutput=true]$PR_NUMBER"
+        displayName: 'Create ArgoCD PR'
+        name: CreatePR
+        condition: and(succeeded(), eq(variables['CheckPR.PR_ALREADY_EXISTED'], 'false'))
+
+      # ── Step 4: Approve PR (approver bot — different identity) ─
+      - bash: |
+          set -e
+          # Use PR_NUMBER from whichever step set it
+          PR_NUM="${PR_NUMBER:-$(CheckPR.PR_NUMBER)}"
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $(ARGOCD_APPROVER_TOKEN)" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ parameters.argocdRepoOwner }}/${{ parameters.argocdRepoName }}/pulls/$PR_NUM/reviews" \
+            -d "{\"event\":\"APPROVE\",\"body\":\"Auto-approved by dss-devops-argocd-approver bot. Build $(Build.BuildId).\"}")
+
+          STATE=$(echo "$RESPONSE" | jq -r '.state')
+          if [ "$STATE" != "APPROVED" ]; then
+            echo "##[error] Approval failed. Response: $RESPONSE"
+            exit 1
+          fi
+          echo "✅ PR #$PR_NUM approved (state: $STATE)"
+        displayName: 'Approve ArgoCD PR'
+        env:
+          PR_NUMBER: $(CreatePR.PR_NUMBER)
+        condition: succeeded()
+
+      # ── Step 5: Merge PR ───────────────────────────────────────
+      - bash: |
+          set -e
+          PR_NUM="${PR_NUMBER:-$(CheckPR.PR_NUMBER)}"
+          COMMIT_TITLE="chore(${{ parameters.appName }}): deploy ${{ parameters.imageTag }} [Build $(Build.BuildId)]"
+
+          RESPONSE=$(curl -s -X PUT \
+            -H "Authorization: Bearer $(ARGOCD_PR_CREATOR_TOKEN)" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ parameters.argocdRepoOwner }}/${{ parameters.argocdRepoName }}/pulls/$PR_NUM/merge" \
+            -d "{\"commit_title\":\"$COMMIT_TITLE\",\"merge_method\":\"squash\"}")
+
+          MSG=$(echo "$RESPONSE" | jq -r '.message')
+          MERGED=$(echo "$RESPONSE" | jq -r '.merged')
+
+          if [ "$MERGED" != "true" ]; then
+            echo "##[error] Merge failed. Message: $MSG"
+            exit 1
+          fi
+          echo "✅ PR #$PR_NUM merged. Message: $MSG"
+        displayName: 'Merge ArgoCD PR'
+        env:
+          PR_NUMBER: $(CreatePR.PR_NUMBER)
+        condition: succeeded()
+
+#################################################################
+# ── ADD THIS BLOCK after OCP4_Deploy stage ──────────────────────
+- ${{ if and(not(parameters.skipDeploy), ne(variables['Build.Reason'], 'PullRequest'), ne(parameters.deploy_service_name, '')) }}:
+  - stage: ArgoCD_PR_Automation
+    displayName: 'ArgoCD: Auto PR → Approve → Merge'
+    dependsOn: OCP4_Deploy
+    condition: succeeded()
+    jobs:
+      - template: pipeline_templates/utils/argocd-auto-pr.yml
+        parameters:
+          argocdRepoOwner: 'BMO-Prod'
+          argocdRepoName:  '${{ parameters.argocdRepoName }}'
+          headBranch:      'deploy/${{ parameters.deploy_service_name }}-$(Build.BuildId)'
+          baseBranch:      'master'
+          appName:         '${{ parameters.deploy_service_name }}'
+          imageTag:        '$(IMAGE_TAG)'
+
+###############################################################  
+stages:
+  - template: dss-devops-template.yml@dss_devops_templates
+    parameters:
+      skipBuild:    ${{ parameters.skipBuild }}
+      skipDeploy:   ${{ parameters.skipDeploy }}
+      skipTest:     ${{ parameters.skipTest }}
+      # ... all existing params stay exactly the same ...
+
+      # ── ADD ONLY THIS ONE NEW LINE ──
+      argocdRepoName: 'your-argocd-config-repo-name'
