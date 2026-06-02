@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-GIC_63623 - ADO Service Connection Audit + Pipeline Mapping
-Balanced accuracy version:
-- Works for YAML and Classic pipelines
-- Uses execution history for counts only
-- Uses structured definition scan for current pipeline mapping
-- Avoids broad false positives
-- Allows normalized name matching in usage fields
+GIC_63623 - Accurate ADO Service Connection YAML Scanner
+Goal:
+- For each service connection, list pipelines where that SC is referenced in YAML
+- Works best for YAML pipelines
+- Also handles classic definitions only when they have YAML-like task/process data
+- Avoids execution history and timeline false positives
 """
 
 import argparse
 import base64
 import csv
 import getpass
+import json
 import re
 import sys
 from datetime import datetime
+from urllib.parse import quote
 
 try:
     import requests
@@ -39,38 +40,29 @@ KNOWN_CONNECTIONS = [
 
 USAGE_KEYS = {
     "endpoint",
-    "endpointid",
     "serviceconnection",
-    "serviceconnectionid",
     "serviceconnectionname",
     "serviceendpoint",
     "serviceendpointid",
     "connectedservice",
-    "connectedserviceid",
     "connectedservicename",
+    "connectedserviceid",
     "connectedservicearm",
     "connectedserviceazurerm",
     "azuresubscription",
+    "sonarconnection",
     "containerregistry",
     "dockerregistryserviceconnection",
     "kubernetesserviceconnection",
-    "sonarconnection",
-    "sonarqube",
-    "artifactoryservice",
     "artifactoryconnection",
     "jfrogserviceconnection",
-    "target_artifactory_connection",
     "source_artifactory_connection",
+    "target_artifactory_connection",
     "connection",
     "repositoryendpoint",
-    "dockerregistryendpoint",
     "externalendpoint",
     "nugetserviceconnection",
     "npmserviceconnection"
-}
-
-CONTEXT_HINTS = {
-    "inputs", "parameters", "repositories", "resources", "task", "tasks", "steps", "deploy", "job", "jobs"
 }
 
 def get_headers(pat):
@@ -97,16 +89,6 @@ def ado_get(url, headers):
         print(f"  WARNING Request failed: {url} -> {e}", flush=True)
         return None
 
-def safe_get(dct, *keys):
-    cur = dct
-    for k in keys:
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(k)
-        if cur is None:
-            return None
-    return cur
-
 def normalize(value):
     if value is None:
         return ""
@@ -116,109 +98,126 @@ def canonical(value):
     s = normalize(value).lower()
     return re.sub(r"[^a-z0-9]", "", s)
 
-def exact_eq(a, b):
-    return normalize(a).lower() == normalize(b).lower()
+def canon_match(a, b):
+    return canonical(a) and canonical(a) == canonical(b)
 
-def canon_eq(a, b):
-    return canonical(a) == canonical(b) and canonical(a) != ""
+def extract_yaml_from_definition(detail):
+    config = detail.get("process", {}) or {}
+    if isinstance(config, dict):
+        yaml_file = config.get("yamlFilename") or config.get("yamlfilename") or ""
+        if yaml_file:
+            return yaml_file
 
-def looks_like_usage_context(path_parts):
-    lowered = {p.lower() for p in path_parts}
-    return any(x in lowered for x in CONTEXT_HINTS)
+    # fallback to repository + path if available
+    repo = detail.get("repository", {}) or {}
+    path = repo.get("defaultBranch", "") or ""
+    return ""
 
-def detect_service_connection_refs(obj, sc_name, sc_id, found_matches, path_parts=None):
-    if path_parts is None:
-        path_parts = []
+def find_referenced_yaml(detail):
+    # For classic definitions, try to locate YAML-like path if present.
+    process = detail.get("process", {}) or {}
+    if isinstance(process, dict):
+        yaml_filename = process.get("yamlFilename")
+        if yaml_filename:
+            return yaml_filename
+    return ""
 
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            key_str = str(k)
-            key_l = key_str.lower()
-            current_path = path_parts + [key_str]
+def get_yaml_content(base_url, project_name, repo_id, yaml_path, headers, default_branch=""):
+    if not repo_id or not yaml_path:
+        return None
 
-            if isinstance(v, (dict, list)):
-                detect_service_connection_refs(v, sc_name, sc_id, found_matches, current_path)
-            else:
-                value = normalize(v)
-                path_l = [p.lower() for p in path_parts]
+    encoded_path = quote(yaml_path, safe="/")
+    versions = []
 
-                # 1. Exact ID match anywhere
-                if sc_id and exact_eq(value, sc_id):
-                    found_matches.append({
-                        "Path": ".".join(current_path),
-                        "MatchType": "ExactIdMatch",
-                        "MatchedKey": key_str,
-                        "MatchedValue": value
-                    })
-                    continue
+    if default_branch:
+        versions.append(default_branch)
 
-                # 2. Exact name match in usage keys
-                if sc_name and key_l in USAGE_KEYS and exact_eq(value, sc_name):
-                    found_matches.append({
-                        "Path": ".".join(current_path),
-                        "MatchType": "ExactNameMatch_UsageKey",
-                        "MatchedKey": key_str,
-                        "MatchedValue": value
-                    })
-                    continue
+    versions += ["refs/heads/main", "refs/heads/master", "main", "master", ""]
 
-                # 3. Normalized name match in usage keys
-                if sc_name and key_l in USAGE_KEYS and canon_eq(value, sc_name):
-                    found_matches.append({
-                        "Path": ".".join(current_path),
-                        "MatchType": "NormalizedNameMatch_UsageKey",
-                        "MatchedKey": key_str,
-                        "MatchedValue": value
-                    })
-                    continue
+    seen = set()
+    versions = [v for v in versions if not (v in seen or seen.add(v))]
 
-                # 4. Repo resources endpoint
-                if (
-                    sc_name and
-                    key_l == "endpoint" and
-                    ("resources" in path_l or "repositories" in path_l) and
-                    canon_eq(value, sc_name)
-                ):
-                    found_matches.append({
-                        "Path": ".".join(current_path),
-                        "MatchType": "RepoEndpointMatch",
-                        "MatchedKey": key_str,
-                        "MatchedValue": value
-                    })
-                    continue
+    for branch in versions:
+        if branch:
+            url = (
+                f"{base_url}/{project_name}/_apis/git/repositories/{repo_id}/items"
+                f"?path={encoded_path}"
+                f"&includeContent=true"
+                f"&versionDescriptor.version={quote(branch, safe='')}"
+                f"&versionDescriptor.versionType=branch"
+                f"&api-version=7.1"
+            )
+        else:
+            url = (
+                f"{base_url}/{project_name}/_apis/git/repositories/{repo_id}/items"
+                f"?path={encoded_path}"
+                f"&includeContent=true"
+                f"&api-version=7.1"
+            )
 
-                # 5. Inputs/parameters context with exact key hints
-                if sc_name and looks_like_usage_context(path_parts):
-                    if key_l in USAGE_KEYS and canon_eq(value, sc_name):
-                        found_matches.append({
-                            "Path": ".".join(current_path),
-                            "MatchType": "ContextualUsageMatch",
-                            "MatchedKey": key_str,
-                            "MatchedValue": value
-                        })
-                        continue
+        data = ado_get(url, headers)
+        if not data:
+            continue
 
-    elif isinstance(obj, list):
-        for idx, item in enumerate(obj):
-            detect_service_connection_refs(item, sc_name, sc_id, found_matches, path_parts + [f"[{idx}]"])
+        if isinstance(data, dict) and data.get("content"):
+            return data["content"]
 
-def classify(is_dss, pipeline_count, is_known, times_used):
-    if is_dss:
-        return "KEEP - DSS Standard"
-    if pipeline_count > 0 or times_used > 0:
-        return "REVIEW - In use, non-standard"
-    if is_known:
-        return "CANDIDATE FOR REMOVAL - No pipeline evidence found"
-    return "REVIEW - Unknown connection"
+        if isinstance(data, str) and data.strip():
+            return data
+
+    return None
+
+def line_based_yaml_match(yaml_text, sc_name, sc_id):
+    """
+    Look for exact SC name/id in lines where the key suggests service connection usage.
+    """
+    if not yaml_text:
+        return []
+
+    matches = []
+    sc_name_l = normalize(sc_name).lower()
+    sc_id_l = normalize(sc_id).lower()
+
+    if not sc_name_l and not sc_id_l:
+        return matches
+
+    lines = yaml_text.splitlines()
+    key_patterns = [
+        "endpoint:", "serviceconnection:", "serviceConnection:",
+        "sonarconnection:", "connectedservicename:", "connectedservice:",
+        "source_artifactory_connection:", "target_artifactory_connection:",
+        "dockerregistryserviceconnection:", "kubernetesserviceconnection:",
+        "artifactoryconnection:", "jfrogserviceconnection:"
+    ]
+
+    for i, line in enumerate(lines, start=1):
+        l = line.strip()
+        low = l.lower()
+
+        if not any(k.lower() in low for k in key_patterns):
+            continue
+
+        if sc_id_l and sc_id_l in low:
+            matches.append((i, line.strip(), "ID"))
+            continue
+
+        if sc_name_l and canon_match(sc_name, line):
+            matches.append((i, line.strip(), "NAME"))
+            continue
+
+        # also catch exact name if it appears in a quoted scalar on a relevant line
+        if sc_name_l and sc_name_l in low:
+            matches.append((i, line.strip(), "NAME_SUBSTRING"))
+            continue
+
+    return matches
 
 def main():
-    parser = argparse.ArgumentParser(description="ADO Service Connection Audit + Pipeline Mapping")
+    parser = argparse.ArgumentParser(description="ADO YAML Service Connection Usage Scanner")
     parser.add_argument("--org", required=False)
     parser.add_argument("--project", required=False)
     parser.add_argument("--output-prefix", required=False, default="")
     args = parser.parse_args()
-
-    print("Starting audit_service_connection.py", flush=True)
 
     org = args.org or input("Enter your ADO Organization name: ").strip()
     project_name = args.project or input("Enter project name (e.g. GIC_63623): ").strip()
@@ -227,156 +226,108 @@ def main():
     pat = getpass.getpass("")
 
     if not org or not project_name or not pat:
-        print("ERROR: org, project, and PAT are required.", flush=True)
+        print("ERROR: org, project, and PAT are required.")
         sys.exit(1)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     prefix = args.output_prefix or f"{project_name}_{ts}"
 
-    audit_csv = f"{prefix}_service_connection_audit.csv"
     sc_to_pipe_csv = f"{prefix}_service_connection_to_pipelines.csv"
     pipe_to_sc_csv = f"{prefix}_pipeline_to_service_connections.csv"
-    raw_evidence_csv = f"{prefix}_raw_evidence.csv"
+    raw_csv = f"{prefix}_raw_yaml_matches.csv"
 
     headers = get_headers(pat)
     base_url = f"https://dev.azure.com/{org}"
 
-    print(f"\nScanning project: {project_name}", flush=True)
-
-    print("[1/4] Fetching service connections...", flush=True)
+    print("\n[1/4] Fetching service connections...")
     sc_url = f"{base_url}/{project_name}/_apis/serviceendpoint/endpoints?includeDetails=true&api-version=7.1"
     sc_data = ado_get(sc_url, headers)
     if not sc_data:
-        print("ERROR: Failed to retrieve service connections.", flush=True)
+        print("ERROR: Could not fetch service connections.")
         sys.exit(1)
 
     service_connections = sc_data.get("value", [])
-    print(f"  Found {len(service_connections)} service connections.", flush=True)
+    print(f"  Found {len(service_connections)} service connections.")
 
     sc_by_name = {}
     for sc in service_connections:
-        sc_name = normalize(sc.get("name"))
-        if sc_name:
-            sc_by_name[sc_name] = sc
+        name = normalize(sc.get("name"))
+        if name:
+            sc_by_name[name] = sc
 
-    print("[2/4] Fetching build definitions...", flush=True)
+    print("[2/4] Fetching build definitions...")
     defs_url = f"{base_url}/{project_name}/_apis/build/definitions?api-version=7.1&$top=500"
     defs_data = ado_get(defs_url, headers)
     if not defs_data:
-        print("ERROR: Failed to retrieve build definitions.", flush=True)
+        print("ERROR: Could not fetch build definitions.")
         sys.exit(1)
 
     build_defs = defs_data.get("value", [])
-    print(f"  Found {len(build_defs)} build definitions.", flush=True)
+    print(f"  Found {len(build_defs)} build definitions.")
 
-    sc_to_pipelines = {name: set() for name in sc_by_name.keys()}
+    sc_to_pipelines = {name: set() for name in sc_by_name}
     pipeline_to_scs = {}
-    times_used_by_sc = {}
-    last_used_by_sc = {}
-    raw_evidence_rows = []
+    raw_rows = []
 
-    print("[3/4] Scanning build definitions with balanced matching...", flush=True)
-    for bd in build_defs:
+    print("[3/4] Reading YAML and matching service connections...")
+    for i, bd in enumerate(build_defs, start=1):
         def_id = str(bd.get("id", "")).strip()
         def_name = normalize(bd.get("name"))
+        repo = bd.get("repository", {}) or {}
+        repo_id = normalize(repo.get("id"))
+        repo_name = normalize(repo.get("name"))
+        default_branch = normalize(repo.get("defaultBranch"))
 
-        print(f"  -> {def_name}", flush=True)
+        yaml_path = find_referenced_yaml(bd)
+        if not yaml_path:
+            continue
 
-        detail_url = f"{base_url}/{project_name}/_apis/build/definitions/{def_id}?api-version=7.1"
-        detail = ado_get(detail_url, headers)
-        if not detail:
+        yaml_text = get_yaml_content(base_url, project_name, repo_id, yaml_path, headers, default_branch)
+        if not yaml_text:
             continue
 
         for sc_name, sc in sc_by_name.items():
             sc_id = normalize(sc.get("id"))
-            found_matches = []
-            detect_service_connection_refs(detail, sc_name, sc_id, found_matches)
+            matches = line_based_yaml_match(yaml_text, sc_name, sc_id)
 
-            if found_matches:
+            if matches:
                 sc_to_pipelines[sc_name].add(def_name)
                 pipeline_to_scs.setdefault(def_name, set()).add(sc_name)
 
-                for m in found_matches:
-                    raw_evidence_rows.append({
+                for line_no, line_text, match_type in matches:
+                    raw_rows.append({
                         "Project": project_name,
+                        "PipelineId": def_id,
+                        "PipelineName": def_name,
+                        "Repository": repo_name,
+                        "YamlPath": yaml_path,
                         "ServiceConnectionName": sc_name,
                         "ServiceConnectionId": sc_id,
-                        "EvidenceType": m["MatchType"],
-                        "PipelineName": def_name,
-                        "BuildDefinitionId": def_id,
-                        "Detail": m["Path"],
-                        "MatchedKey": m["MatchedKey"],
-                        "MatchedValue": m["MatchedValue"]
+                        "MatchType": match_type,
+                        "LineNumber": line_no,
+                        "LineText": line_text
                     })
 
-    print("[4/4] Reading execution history for counts...", flush=True)
-    for sc_name, sc in sc_by_name.items():
-        sc_id = normalize(sc.get("id"))
-        hist_url = f"{base_url}/{project_name}/_apis/serviceendpoint/{sc_id}/executionhistory?top=500&api-version=7.0"
-        hist = ado_get(hist_url, headers)
+        print(f"  [{i}/{len(build_defs)}] {def_name}", flush=True)
 
-        if hist and hist.get("count", 0) > 0:
-            items = hist.get("value", [])
-            times_used_by_sc[sc_name] = len(items)
-
-            latest = ""
-            for item in items:
-                finish = safe_get(item, "data", "finishTime")
-                if isinstance(finish, str) and finish and finish > latest:
-                    latest = finish
-
-            last_used_by_sc[sc_name] = latest[:10] if latest else "Unknown"
-        else:
-            times_used_by_sc[sc_name] = 0
-            last_used_by_sc[sc_name] = "Never"
-
-    for sc_name, pipe_set in sc_to_pipelines.items():
-        for pipe in pipe_set:
-            pipeline_to_scs.setdefault(pipe, set()).add(sc_name)
-
-    audit_rows = []
-    for sc_name, sc in sc_by_name.items():
-        pipes = sorted(sc_to_pipelines.get(sc_name, set()))
-        pipeline_count = len(pipes)
-        is_dss = sc_name.startswith(DSS_PREFIX)
-        is_known = sc_name in KNOWN_CONNECTIONS
-
-        audit_rows.append({
-            "Project": project_name,
-            "ConnectionName": sc_name,
-            "ConnectionID": sc.get("id", ""),
-            "Type": sc.get("type", ""),
-            "IsShared": sc.get("isShared", False),
-            "IsDssStandard": is_dss,
-            "IsReady": sc.get("isReady", False),
-            "TimesUsed_Last500": times_used_by_sc.get(sc_name, 0),
-            "LastUsedDate": last_used_by_sc.get(sc_name, "Never"),
-            "PipelineCount": pipeline_count,
-            "PipelinesUsing": " | ".join(pipes),
-            "AuthScheme": safe_get(sc, "authorization", "scheme") or "",
-            "CreatedBy": safe_get(sc, "createdBy", "displayName") or "",
-            "Description": sc.get("description", ""),
-            "Recommendation": classify(is_dss, pipeline_count, is_known, times_used_by_sc.get(sc_name, 0))
-        })
+    print("[4/4] Writing outputs...")
 
     sc_to_pipe_rows = []
     for sc_name in sorted(sc_by_name.keys(), key=lambda x: x.lower()):
-        sc_obj = sc_by_name[sc_name]
+        sc = sc_by_name[sc_name]
         pipes = sorted(sc_to_pipelines.get(sc_name, set()))
         sc_to_pipe_rows.append({
             "Project": project_name,
             "ServiceConnectionName": sc_name,
-            "ServiceConnectionId": sc_obj.get("id", ""),
-            "Type": sc_obj.get("type", ""),
-            "IsShared": sc_obj.get("isShared", False),
+            "ServiceConnectionId": sc.get("id", ""),
+            "Type": sc.get("type", ""),
+            "IsShared": sc.get("isShared", False),
             "PipelineCount": len(pipes),
-            "PipelinesUsing": " | ".join(pipes),
-            "TimesUsed": times_used_by_sc.get(sc_name, 0),
-            "LastUsedDate": last_used_by_sc.get(sc_name, "Never")
+            "PipelinesUsing": " | ".join(pipes)
         })
 
     pipe_to_sc_rows = []
-    for bd in sorted(build_defs, key=lambda x: x.get("name", "").lower()):
+    for bd in sorted(build_defs, key=lambda x: normalize(x.get("name")).lower()):
         def_name = normalize(bd.get("name"))
         def_id = bd.get("id", "")
         scs = sorted(pipeline_to_scs.get(def_name, set()))
@@ -388,25 +339,6 @@ def main():
             "ServiceConnectionsUsed": " | ".join(scs)
         })
 
-    raw_dedup = {}
-    for row in raw_evidence_rows:
-        key = (
-            row["ServiceConnectionName"],
-            row["EvidenceType"],
-            row["PipelineName"],
-            str(row["BuildDefinitionId"]),
-            str(row["Detail"]),
-            str(row["MatchedKey"]),
-            str(row["MatchedValue"])
-        )
-        raw_dedup[key] = row
-    raw_evidence_rows = list(raw_dedup.values())
-
-    with open(audit_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(audit_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(sorted(audit_rows, key=lambda x: x["ConnectionName"].lower()))
-
     with open(sc_to_pipe_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(sc_to_pipe_rows[0].keys()))
         writer.writeheader()
@@ -417,35 +349,22 @@ def main():
         writer.writeheader()
         writer.writerows(pipe_to_sc_rows)
 
-    with open(raw_evidence_csv, "w", newline="", encoding="utf-8") as f:
-        if raw_evidence_rows:
-            writer = csv.DictWriter(f, fieldnames=list(raw_evidence_rows[0].keys()))
+    with open(raw_csv, "w", newline="", encoding="utf-8") as f:
+        if raw_rows:
+            writer = csv.DictWriter(f, fieldnames=list(raw_rows[0].keys()))
             writer.writeheader()
-            writer.writerows(sorted(
-                raw_evidence_rows,
-                key=lambda x: (
-                    x["ServiceConnectionName"].lower(),
-                    x["PipelineName"].lower(),
-                    x["EvidenceType"].lower()
-                )
-            ))
+            writer.writerows(sorted(raw_rows, key=lambda x: (x["ServiceConnectionName"].lower(), x["PipelineName"].lower())))
         else:
             writer = csv.writer(f)
-            writer.writerow([
-                "Project", "ServiceConnectionName", "ServiceConnectionId",
-                "EvidenceType", "PipelineName", "BuildDefinitionId", "Detail",
-                "MatchedKey", "MatchedValue"
-            ])
+            writer.writerow(["Project", "PipelineId", "PipelineName", "Repository", "YamlPath", "ServiceConnectionName", "ServiceConnectionId", "MatchType", "LineNumber", "LineText"])
 
-    print("\nDone.", flush=True)
-    print(f"Audit CSV                  : {audit_csv}", flush=True)
-    print(f"SC -> Pipelines CSV        : {sc_to_pipe_csv}", flush=True)
-    print(f"Pipeline -> SC CSV         : {pipe_to_sc_csv}", flush=True)
-    print(f"Raw Evidence CSV           : {raw_evidence_csv}", flush=True)
+    print("\nDone.")
+    print(f"SC -> Pipelines CSV : {sc_to_pipe_csv}")
+    print(f"Pipeline -> SC CSV  : {pipe_to_sc_csv}")
+    print(f"Raw YAML Match CSV  : {raw_csv}")
 
-    print("\nPreview:", flush=True)
     for row in sorted(sc_to_pipe_rows, key=lambda x: (-x["PipelineCount"], x["ServiceConnectionName"].lower()))[:10]:
-        print(f"  {row['ServiceConnectionName']}: {row['PipelineCount']} pipeline(s)", flush=True)
+        print(f"{row['ServiceConnectionName']}: {row['PipelineCount']} pipeline(s)")
 
 if __name__ == "__main__":
     main()
