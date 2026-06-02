@@ -2,16 +2,16 @@
 """
 GIC_63623 - ADO Service Connection Audit + Pipeline Mapping
 Python 3.9 compatible
-Uses Build Definitions API (works for classic pipelines too)
+Uses Build Definitions API
 """
 
 import argparse
 import base64
 import csv
 import getpass
+import json
 import sys
 from datetime import datetime
-from urllib.parse import quote
 
 try:
     import requests
@@ -29,7 +29,7 @@ KNOWN_CONNECTIONS = [
     "dss_devops_s_openshift_water", "dss_devops_sc_sonarqube",
     "GIC_63623_SonarQube", "github.com_sa-onboarding_bmogc-Belle_Isle",
     "Frog_gic", "Frog_gic_Saas", "jfrog-artifactory", "jfrog-connection",
-    "jfrog-connection-publish", "Jfrog-gic", "SPLAT_Components_27437",
+    "jfrog-connection-publish", "Jfrog-gic", "SPLAT_Components_24757",
     "svc_bwa_dev01", "test_connection", "Testing-artifactory-token"
 ]
 
@@ -62,7 +62,7 @@ def classify(is_dss, pipeline_count, is_known):
     if pipeline_count > 0:
         return "REVIEW - In use, non-standard"
     if is_known:
-        return "CANDIDATE FOR REMOVAL - Not found in YAML scan"
+        return "CANDIDATE FOR REMOVAL - Not found in definition scan"
     return "REVIEW - Unknown connection"
 
 def main():
@@ -103,59 +103,51 @@ def main():
         sys.exit(1)
 
     service_connections = sc_data.get("value", [])
-    print(f"  Found {len(service_connections)} service connections.", flush=True)
+    print(f"Found {len(service_connections)} service connections.", flush=True)
 
     sc_by_name = {}
     for sc in service_connections:
         sc_name = sc.get("name", "")
         sc_by_name[sc_name] = sc
 
-    # 2. Get build definitions (works for classic + YAML)
+    # 2. Get build definitions
     print("[2/4] Fetching build definitions...", flush=True)
-    defs_url = f"{base_url}/{project_name}/_apis/build/definitions?api-version=7.1&%24top=500"
+    defs_url = f"{base_url}/{project_name}/_apis/build/definitions?api-version=7.1&$top=500"
     defs_data = ado_get(defs_url, headers)
     if not defs_data:
         print("ERROR: Failed to retrieve build definitions.", flush=True)
         sys.exit(1)
 
     build_defs = defs_data.get("value", [])
-    print(f"  Found {len(build_defs)} build definitions.", flush=True)
+    print(f"Found {len(build_defs)} build definitions.", flush=True)
 
     pipeline_map_rows = []
     usage_by_sc = {}
 
-    # 3. Scan build definitions for service connection references
+    # 3. Scan build definitions for SC references
     print("[3/4] Scanning build definitions for service connection references...", flush=True)
     for bd in build_defs:
         def_id = bd.get("id", "")
         def_name = bd.get("name", "")
-        def_type = bd.get("type", "unknown")
 
-        print(f"  -> Definition: {def_name} (id={def_id})", flush=True)
+        print(f"-> Definition: {def_name} (id={def_id})", flush=True)
 
-        # Get full definition
         detail_url = f"{base_url}/{project_name}/_apis/build/definitions/{def_id}?api-version=7.1"
         detail = ado_get(detail_url, headers)
         if not detail:
-            print(f"     Could not get definition details", flush=True)
+            print("   Could not get definition details", flush=True)
             continue
 
-        # Get repository
         repo = detail.get("repository", {}) or {}
-        repo_id = repo.get("id", "")
         repo_name = repo.get("name", "")
+        repo_type = repo.get("type", "")
         default_branch = repo.get("defaultBranch", "")
-        repo_type = repo.get("type", "unknown")
 
-        # Get process (YAML)
         process = detail.get("process", {}) or {}
         yaml_path = process.get("yamlFilename", "")
-        yaml_type = process.get("type", "unknown")
 
-        matched_count = 0
-
-        # Search in full definition JSON for service connection names/IDs
         full_text = json.dumps(detail).lower()
+        matched_count = 0
 
         for sc_name, sc in sc_by_name.items():
             sc_id = str(sc.get("id", "")).lower()
@@ -177,25 +169,22 @@ def main():
                     "Project": project_name,
                     "PipelineId": def_id,
                     "PipelineName": def_name,
-                    "PipelineType": "BuildDefinition",
+                    "PipelineType": "YAML" if yaml_path else "Classic/Unknown",
                     "Repository": repo_name,
                     "RepoType": repo_type,
                     "DefaultBranch": default_branch,
-                    "YamlPath": yaml_path or "Classic/Unknown",
-                    "BranchUsed": default_branch or "default",
+                    "YamlPath": yaml_path if yaml_path else "",
                     "ServiceConnectionName": sc_name,
                     "ServiceConnectionId": sc.get("id", ""),
                     "ServiceConnectionType": sc.get("type", ""),
                     "IsShared": sc.get("isShared", False),
                     "DetectionMethod": method
                 })
-
                 usage_by_sc.setdefault(sc_name, set()).add(def_name)
 
-        pipeline_type = "YAML" if yaml_path else "Classic"
-        print(f"     Type: {pipeline_type} | Repo: {repo_name} | Matched {matched_count} SC(s)", flush=True)
+        print(f"   Matched {matched_count} service connection(s)", flush=True)
 
-    # 4. Add execution history
+    # 4. Execution history
     print("[4/4] Scanning execution history...", flush=True)
     last_used_by_sc = {}
     times_used_by_sc = {}
@@ -205,6 +194,7 @@ def main():
         sc_id = sc.get("id", "")
         hist_url = f"{base_url}/{project_name}/_apis/serviceendpoint/{sc_id}/executionhistory?top=100&api-version=7.0"
         hist = ado_get(hist_url, headers)
+
         if hist and hist.get("count", 0) > 0:
             items = hist.get("value", [])
             times_used_by_sc[sc_name] = len(items)
@@ -231,8 +221,7 @@ def main():
         dedup[key] = row
     pipeline_map_rows = list(dedup.values())
 
-    # build audit rows
-    import json
+    # build audit
     audit_rows = []
     found_sc_names = set(sc_by_name.keys())
     missing_known = [x for x in KNOWN_CONNECTIONS if x not in found_sc_names]
@@ -287,7 +276,7 @@ def main():
         writer.writeheader()
         writer.writerows(sorted(audit_rows, key=lambda x: x["ConnectionName"].lower()))
 
-    # write pipeline map csv
+    # write map csv
     if pipeline_map_rows:
         with open(map_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(pipeline_map_rows[0].keys()))
@@ -304,9 +293,8 @@ def main():
             writer = csv.writer(f)
             writer.writerow([
                 "Project", "PipelineId", "PipelineName", "PipelineType", "Repository",
-                "RepoType", "DefaultBranch", "YamlPath", "BranchUsed",
-                "ServiceConnectionName", "ServiceConnectionId", "ServiceConnectionType",
-                "IsShared", "DetectionMethod"
+                "RepoType", "DefaultBranch", "YamlPath", "ServiceConnectionName",
+                "ServiceConnectionId", "ServiceConnectionType", "IsShared", "DetectionMethod"
             ])
 
     print("\nDone.", flush=True)
@@ -321,5 +309,4 @@ def main():
         print(f"  PipelinesUsing: {match[0]['PipelinesUsing']}", flush=True)
 
 if __name__ == "__main__":
-    import json
     main()
