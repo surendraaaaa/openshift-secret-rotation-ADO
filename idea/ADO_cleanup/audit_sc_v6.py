@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
 GIC_63623 - ADO Service Connection Audit + Pipeline Mapping
-Accurate version:
+Balanced accuracy version:
 - Works for YAML and Classic pipelines
 - Uses execution history for counts only
-- Uses exact structured definition scan for current pipeline mapping
-- Avoids false positives from broad substring matching
+- Uses structured definition scan for current pipeline mapping
+- Avoids broad false positives
+- Allows normalized name matching in usage fields
 """
 
 import argparse
 import base64
 import csv
 import getpass
-import json
+import re
 import sys
 from datetime import datetime
 
@@ -50,7 +51,6 @@ USAGE_KEYS = {
     "connectedservicearm",
     "connectedserviceazurerm",
     "azuresubscription",
-    "azureSubscription".lower(),
     "containerregistry",
     "dockerregistryserviceconnection",
     "kubernetesserviceconnection",
@@ -61,7 +61,16 @@ USAGE_KEYS = {
     "jfrogserviceconnection",
     "target_artifactory_connection",
     "source_artifactory_connection",
-    "connection"
+    "connection",
+    "repositoryendpoint",
+    "dockerregistryendpoint",
+    "externalendpoint",
+    "nugetserviceconnection",
+    "npmserviceconnection"
+}
+
+CONTEXT_HINTS = {
+    "inputs", "parameters", "repositories", "resources", "task", "tasks", "steps", "deploy", "job", "jobs"
 }
 
 def get_headers(pat):
@@ -103,8 +112,19 @@ def normalize(value):
         return ""
     return str(value).strip()
 
+def canonical(value):
+    s = normalize(value).lower()
+    return re.sub(r"[^a-z0-9]", "", s)
+
 def exact_eq(a, b):
     return normalize(a).lower() == normalize(b).lower()
+
+def canon_eq(a, b):
+    return canonical(a) == canonical(b) and canonical(a) != ""
+
+def looks_like_usage_context(path_parts):
+    lowered = {p.lower() for p in path_parts}
+    return any(x in lowered for x in CONTEXT_HINTS)
 
 def detect_service_connection_refs(obj, sc_name, sc_id, found_matches, path_parts=None):
     if path_parts is None:
@@ -116,11 +136,11 @@ def detect_service_connection_refs(obj, sc_name, sc_id, found_matches, path_part
             key_l = key_str.lower()
             current_path = path_parts + [key_str]
 
-            # recurse first
             if isinstance(v, (dict, list)):
                 detect_service_connection_refs(v, sc_name, sc_id, found_matches, current_path)
             else:
                 value = normalize(v)
+                path_l = [p.lower() for p in path_parts]
 
                 # 1. Exact ID match anywhere
                 if sc_id and exact_eq(value, sc_id):
@@ -132,7 +152,7 @@ def detect_service_connection_refs(obj, sc_name, sc_id, found_matches, path_part
                     })
                     continue
 
-                # 2. Exact name match only in allowed usage keys
+                # 2. Exact name match in usage keys
                 if sc_name and key_l in USAGE_KEYS and exact_eq(value, sc_name):
                     found_matches.append({
                         "Path": ".".join(current_path),
@@ -142,35 +162,41 @@ def detect_service_connection_refs(obj, sc_name, sc_id, found_matches, path_part
                     })
                     continue
 
-                # 3. Special case for repository resources endpoint
-                path_l = [p.lower() for p in path_parts]
-                if (
-                    sc_name and
-                    key_l == "endpoint" and
-                    exact_eq(value, sc_name) and
-                    "resources" in path_l and
-                    "repositories" in path_l
-                ):
+                # 3. Normalized name match in usage keys
+                if sc_name and key_l in USAGE_KEYS and canon_eq(value, sc_name):
                     found_matches.append({
                         "Path": ".".join(current_path),
-                        "MatchType": "ExactNameMatch_RepoEndpoint",
+                        "MatchType": "NormalizedNameMatch_UsageKey",
                         "MatchedKey": key_str,
                         "MatchedValue": value
                     })
                     continue
 
-                # 4. Template/job/task inputs and parameters only if exact key/value match
+                # 4. Repo resources endpoint
                 if (
                     sc_name and
-                    exact_eq(value, sc_name) and
-                    ("inputs" in [p.lower() for p in path_parts] or "parameters" in [p.lower() for p in path_parts])
+                    key_l == "endpoint" and
+                    ("resources" in path_l or "repositories" in path_l) and
+                    canon_eq(value, sc_name)
                 ):
                     found_matches.append({
                         "Path": ".".join(current_path),
-                        "MatchType": "ExactNameMatch_InputsOrParameters",
+                        "MatchType": "RepoEndpointMatch",
                         "MatchedKey": key_str,
                         "MatchedValue": value
                     })
+                    continue
+
+                # 5. Inputs/parameters context with exact key hints
+                if sc_name and looks_like_usage_context(path_parts):
+                    if key_l in USAGE_KEYS and canon_eq(value, sc_name):
+                        found_matches.append({
+                            "Path": ".".join(current_path),
+                            "MatchType": "ContextualUsageMatch",
+                            "MatchedKey": key_str,
+                            "MatchedValue": value
+                        })
+                        continue
 
     elif isinstance(obj, list):
         for idx, item in enumerate(obj):
@@ -217,7 +243,6 @@ def main():
 
     print(f"\nScanning project: {project_name}", flush=True)
 
-    # 1. Service connections
     print("[1/4] Fetching service connections...", flush=True)
     sc_url = f"{base_url}/{project_name}/_apis/serviceendpoint/endpoints?includeDetails=true&api-version=7.1"
     sc_data = ado_get(sc_url, headers)
@@ -234,7 +259,6 @@ def main():
         if sc_name:
             sc_by_name[sc_name] = sc
 
-    # 2. Build definitions
     print("[2/4] Fetching build definitions...", flush=True)
     defs_url = f"{base_url}/{project_name}/_apis/build/definitions?api-version=7.1&$top=500"
     defs_data = ado_get(defs_url, headers)
@@ -251,8 +275,7 @@ def main():
     last_used_by_sc = {}
     raw_evidence_rows = []
 
-    # 3. Accurate definition scan only
-    print("[3/4] Scanning build definitions with exact matching...", flush=True)
+    print("[3/4] Scanning build definitions with balanced matching...", flush=True)
     for bd in build_defs:
         def_id = str(bd.get("id", "")).strip()
         def_name = normalize(bd.get("name"))
@@ -286,7 +309,6 @@ def main():
                         "MatchedValue": m["MatchedValue"]
                     })
 
-    # 4. Execution history for counts only
     print("[4/4] Reading execution history for counts...", flush=True)
     for sc_name, sc in sc_by_name.items():
         sc_id = normalize(sc.get("id"))
@@ -308,12 +330,10 @@ def main():
             times_used_by_sc[sc_name] = 0
             last_used_by_sc[sc_name] = "Never"
 
-    # Reverse map
     for sc_name, pipe_set in sc_to_pipelines.items():
         for pipe in pipe_set:
             pipeline_to_scs.setdefault(pipe, set()).add(sc_name)
 
-    # Audit rows
     audit_rows = []
     for sc_name, sc in sc_by_name.items():
         pipes = sorted(sc_to_pipelines.get(sc_name, set()))
@@ -339,7 +359,6 @@ def main():
             "Recommendation": classify(is_dss, pipeline_count, is_known, times_used_by_sc.get(sc_name, 0))
         })
 
-    # SC -> pipelines
     sc_to_pipe_rows = []
     for sc_name in sorted(sc_by_name.keys(), key=lambda x: x.lower()):
         sc_obj = sc_by_name[sc_name]
@@ -356,7 +375,6 @@ def main():
             "LastUsedDate": last_used_by_sc.get(sc_name, "Never")
         })
 
-    # Pipeline -> SCs
     pipe_to_sc_rows = []
     for bd in sorted(build_defs, key=lambda x: x.get("name", "").lower()):
         def_name = normalize(bd.get("name"))
@@ -370,7 +388,6 @@ def main():
             "ServiceConnectionsUsed": " | ".join(scs)
         })
 
-    # Dedup raw evidence
     raw_dedup = {}
     for row in raw_evidence_rows:
         key = (
@@ -385,7 +402,6 @@ def main():
         raw_dedup[key] = row
     raw_evidence_rows = list(raw_dedup.values())
 
-    # Write files
     with open(audit_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(audit_rows[0].keys()))
         writer.writeheader()
