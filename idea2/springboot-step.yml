@@ -1,3 +1,20 @@
+# ── ArgoCD GitOps parameters ────────────────────────────────────
+- name: argocdRepoName
+  type: string
+  default: 'gitops-argocd-non-prod_15255'
+
+- name: argocdBaseBranch
+  type: string
+  default: 'master'
+
+- name: jiraTicket
+  type: string
+  default: ''
+
+- name: approverEmails
+  type: string
+  default: ''
+
 - ${{ if and(not(parameters.skipDeploy), ne(variables["Build.Reason"], "PullRequest"), ne(parameters.deploy_service_name, '')) }}:
   - stage: ArgoCD_GitOps_Deploy
     displayName: 'ArgoCD GitOps Deploy'
@@ -17,3 +34,4 @@
           argocdRepoName: ${{ parameters.argocdRepoName }}
           argocdBaseBranch: ${{ parameters.argocdBaseBranch }}
           jiraTicket: ${{ parameters.jiraTicket }}
+          approverEmails: ${{ parameters.approverEmails }}
