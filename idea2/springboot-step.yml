@@ -1,0 +1,19 @@
+- ${{ if and(not(parameters.skipDeploy), ne(variables["Build.Reason"], "PullRequest"), ne(parameters.deploy_service_name, '')) }}:
+  - stage: ArgoCD_GitOps_Deploy
+    displayName: 'ArgoCD GitOps Deploy'
+    dependsOn:
+      - OCP4_Deploy
+      - QA_Promotion
+      - PROD_Promotion
+    condition: succeeded()
+    variables:
+      IMAGE_TAG: $[ stageDependencies.OCP4_Deploy.deploy.outputs['CreateImageTag.IMAGE_TAG'] ]
+    jobs:
+      - template: pipeline_templates/utils/argocd-gitops-deploy.yml
+        parameters:
+          deploy_service_name: ${{ parameters.deploy_service_name }}
+          imageTag: $(IMAGE_TAG)
+          agentPoolName: ${{ parameters.agentPoolName }}
+          argocdRepoName: ${{ parameters.argocdRepoName }}
+          argocdBaseBranch: ${{ parameters.argocdBaseBranch }}
+          jiraTicket: ${{ parameters.jiraTicket }}

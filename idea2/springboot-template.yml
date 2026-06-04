@@ -1,0 +1,790 @@
+parameters:
+- name: projectName
+  type: string
+  default: ''
+- name: appShortName
+  type: string
+  default: ''
+- name: appcatID
+  type: string
+  default: ''
+- name: buildType
+  type: string
+  default: ''
+- name: deploy_service_name
+  type: string
+  default: ''
+- name: agentPoolName
+  type: string
+  default: 'Main'
+- name: agentOS
+  type: string
+  default: 'Linux'
+- name: buildCache
+  type: boolean
+  default: true
+- name: mavenBuildGoals
+  type: string
+  default: 'clean install -U'
+- name: artifact_classifier
+  type: string
+  default: '-exec'
+- name: artifact_extension
+  type: string
+  default: 'jar'
+- name: packageFeedReleasePublishRepo
+  type: string
+  default: '$(packageFeedReleasePublishRepo)'
+- name: packageFeedSnapshotPublishRepo
+  type: string
+  default: '$(packageFeedSnapshotPublishRepo)'
+- name: packageFeedReleaseResolveRepo
+  type: string
+  default: '$(packageFeedReleaseResolveRepo)'
+- name: packageFeedSnapshotResolveRepo
+  type: string
+  default: '$(packageFeedSnapshotResolveRepo)'
+- name: ghas_overrideLanguages
+  type: string
+  default: 'Java'
+- name: oc_project
+  type: string
+  default: ''
+- name: openshiftServiceConnection
+  type: string
+  default: ''
+- name: artifactoryServiceConnection
+  type: string
+  default: ''
+- name: sonarqubeServiceConnection
+  type: string
+  default: ''
+- name: githubServiceConnection
+  type: string
+  default: ''
+- name: mavenBuildOptions
+  type: string
+  default: ''
+- name: mavenDeployOptions
+  type: string
+  default: ''
+- name: skipBuild
+  type: boolean
+  default: false
+- name: skipDeploy
+  type: boolean
+  default: true
+- name: skipTest
+  type: boolean
+  default: false
+- name: continueOnSonarError
+  type: boolean
+  default: true
+- name: prevalidationChecksNeeded
+  type: boolean
+  default: true
+- name: jdkVersion
+  type: string
+  default: '17'
+- name: buildJdkArchitecture
+  type: string
+  default: 'x64'
+- name: github_service_endpoint
+  type: string
+  default: ''
+- name: openshiftService
+  type: string
+  default: 'ocp4-water'
+- name: docker-snapshots-repo
+  type: string
+  default: '$(docker-snapshots-repo)'
+- name: artifact_location
+  type: string
+  default: 'com/bmo/channels'
+- name: mavenDeployGoals
+  type: string
+  default: 'deploy'
+- name: mavenBuildPomFilePath
+  type: string
+  default: $(Build.Repository.LocalPath)/pom.xml
+- name: mavenBuildArtifactCustomPath
+  type: string
+  default: ''
+- name: mavenDeployPomFilePath
+  type: string
+  default: $(Build.Repository.LocalPath)/pom.xml
+- name: publishCoverageReportDirectory
+  type: string
+  default: '$(System.DefaultWorkingDirectory)/target/jacoco'
+- name: publishCoverageResultsSummaryFileLocation
+  type: string
+  default: '$(System.DefaultWorkingDirectory)/target/jacoco/jacoco.xml'
+- name: sonarqube
+  type: boolean
+  default: false
+- name: sonarqubeScannerMode
+  type: string
+  default: 'Other'
+- name: sonarqubeProjectKey
+  type: string
+  default: '$(Build.Repository.Name)'
+- name: sonarqubeProjectName
+  type: string
+  default: '$(Build.Repository.Name)'
+- name: sonarqubeProjectVersion
+  type: string
+  default: '1.0'
+- name: sonarqubeExclusions
+  type: string
+  default: '**/generated/**,**/exception/**,**/model/**,**/filter/**,**/logging/**,**/config/**,**/constants/**,**/src/test/**,**/converter/**,**/validation/*,**/main.java/**,**/api/**,**/logplus/**,**/controller/**,**/util/**,**/mapper/**'
+- name: sonarqubeFailOnError
+  type: boolean
+  default: false
+- name: sonarqubeExtraProperties
+  type: string
+  default: |
+    sonar.qualitygate.wait=true
+    sonar.qualitygate.timeout=1800
+    sonar.sources=src/main/java/
+    sonar.language=java
+    sonar.java.binaries=target/classes
+    sonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/surefire/jacoco.xml
+    sonar.junit.reportPaths=target/surefire-reports/
+- name: publishTestResults
+  type: boolean
+  default: true
+- name: enablePromotionSteps
+  type: boolean
+  default: true
+- name: deploy_artifact_name
+  type: string
+  default: ''
+- name: ghas_scanning_required
+  type: boolean
+  default: true
+- name: ghas_pathsIgnore
+  type: object
+  default: []
+- name: releaseBranchOptions
+  displayName: Release Branch Options
+  type: object
+  default:
+    - refs/heads/develop
+    - refs/heads/releases
+    - refs/heads/bugfixes
+- name: source_repo
+  type: string
+  default: ''
+- name: target_repo
+  type: string
+  default: ''
+
+# ── ArgoCD GitOps parameters ────────────────────────────────────
+- name: argocdRepoName
+  type: string
+  default: 'gitops-argocd-non-prod_15255'
+- name: argocdBaseBranch
+  type: string
+  default: 'master'
+# Jira ticket for commit message + PR title (without brackets).
+# e.g. "LSSO-111"  →  becomes [LSSO-111] in commit/PR title.
+# Must satisfy repo ruleset: ^\[[A-Z0-9]+-[0-9]+\].*
+# If blank, falls back to [BUILD-<buildId>].
+- name: jiraTicket
+  type: string
+  default: ''
+
+# ── Angular parameters ──────────────────────────────────────────
+- name: pool_demands
+  type: string
+  default: "agent.os -equals Linux"
+- name: app_short_name
+  type: string
+  default: "."
+- name: appcat
+  type: string
+  default: "."
+- name: node_version
+  type: string
+  default: "."
+- name: source_artifactory_connection
+  type: string
+  default: "."
+- name: package_json_location
+  type: string
+  default: "."
+- name: artifactory_source
+  type: string
+  default: "."
+- name: build_from_npmrc
+  type: string
+  default: "false"
+- name: build_arguments
+  type: string
+  default: "."
+- name: test_required
+  type: string
+  default: "."
+- name: test_arguments
+  type: string
+  default: "."
+- name: test_report_publishing_required
+  type: string
+  default: "."
+- name: test_report_format
+  type: string
+  default: "."
+- name: test_report_name
+  type: string
+  default: "."
+- name: test_report_location
+  type: string
+  default: "."
+- name: publish_coverage
+  type: string
+  default: "."
+- name: report_directory
+  type: string
+  default: "."
+- name: sonar_scan_required
+  type: string
+  default: "."
+- name: sonar_project
+  type: string
+  default: "."
+- name: sonar_connection
+  type: string
+  default: "."
+- name: linting_required
+  type: string
+  default: "."
+- name: lint_arguments
+  type: string
+  default: "."
+- name: npm_build_file_location
+  type: string
+  default: "."
+- name: pack_required
+  type: string
+  default: "."
+- name: archive_required
+  type: string
+  default: "."
+- name: archivefile_extension
+  type: string
+  default: "."
+- name: target_artifactory_connection
+  type: string
+  default: "."
+- name: artifactory_target
+  type: string
+  default: "."
+- name: pack_archive_location
+  type: string
+  default: "."
+- name: custom_versioning
+  type: string
+  default: "false"
+- name: custom_version
+  type: string
+  default: "false"
+- name: run_custom_npm_install
+  type: string
+  default: "false"
+- name: custom_npm_install
+  type: object
+  default:
+- name: run_pre_npm_install_scripts
+  type: object
+  default:
+- name: pre_npm_install_scripts
+  type: object
+  default:
+- name: run_pre_npm_build_scripts
+  type: string
+  default: "false"
+- name: pre_npm_build_scripts
+  type: object
+  default:
+- name: run_pre_publish_scripts
+  type: string
+  default: "false"
+- name: pre_publish_scripts
+  type: object
+  default:
+- name: publish_package
+  type: string
+  default: "false"
+- name: publish_artifactory_Connection
+  type: string
+  default: "."
+- name: publish_artifactory_target
+  type: string
+  default: "."
+- name: publish_package_json_location
+  type: string
+  default: "."
+- name: publish_arguments
+  type: string
+  default: "."
+- name: archive
+  type: string
+  default: "false"
+- name: archive_details
+  type: object
+  default:
+- name: upload
+  type: string
+  default:
+- name: upload_details
+  type: object
+  default: "false"
+- name: depends_On
+  type: object
+  default:
+- name: variables
+  type: object
+  default: []
+- name: cdk_reporting_required
+  type: boolean
+  default: false
+- name: build_file_location
+  type: string
+  default: ""
+- name: artifact_connection
+  type: string
+  default: ""
+- name: artifact_sourceRepo
+  type: string
+  default: ""
+- name: artifact_repository
+  type: string
+  default: ""
+- name: artifact_path
+  type: string
+  default: ""
+- name: pool_name
+  type: string
+  default: ""
+
+# ── Sealights parameters ────────────────────────────────────────
+- name: sealights_enabled
+  type: boolean
+  default: false
+- name: sealights_cleanup_map_files
+  type: boolean
+  default: false
+- name: sealights_integration_build
+  type: boolean
+  default: false
+- name: sealights_app_name
+  type: string
+  default: ""
+
+# ================================================================
+# STAGES
+# ================================================================
+stages:
+
+# ── Build stage ─────────────────────────────────────────────────
+- ${{ if not(parameters.skipBuild) }}:
+  - template: pipeline_templates/build.yml@templates
+    parameters:
+      agentPoolName: ${{ parameters.agentPoolName }}
+      agentOS: '${{ parameters.agentOS }}'
+      jobTimeoutInMinutes: 180
+      buildType: 'maven'
+      jdkVersion: '${{ parameters.jdkVersion }}'
+      mavenBuildPomFilePath: ${{ parameters.mavenBuildPomFilePath }}
+      mavenDeployPomFilePath: ${{ parameters.mavenDeployPomFilePath }}
+      mavenBuildGoals: ${{ parameters.mavenBuildGoals }}
+      publishTestResults: true
+      publishTestResultsFiles: '**/TEST-*.xml'
+      publishCoverageResults: true
+      publishCoverageReportDirectory: '${{ parameters.publishCoverageReportDirectory }}'
+      publishCoverageResultsSummaryFileLocation: '${{ parameters.publishCoverageResultsSummaryFileLocation }}'
+      mavenDeploy: true
+      buildCache: ${{ parameters.buildCache }}
+      mavenDeployGoals: ${{ parameters.mavenDeployGoals }}
+      mavenBuildOptions: ${{ parameters.mavenBuildOptions }}
+      mavenDeployOptions: ${{ parameters.mavenDeployOptions }}
+      packageFeedResolveServiceConnection: '${{ parameters.artifactoryServiceConnection }}'
+      packageFeedReleaseResolveRepo: '${{ parameters.packageFeedReleaseResolveRepo }}'
+      packageFeedSnapshotResolveRepo: '${{ parameters.packageFeedSnapshotResolveRepo }}'
+      packageFeedPublishServiceConnection: '${{ parameters.artifactoryServiceConnection }}'
+      packageFeedReleasePublishRepo: '${{ parameters.packageFeedReleasePublishRepo }}'
+      packageFeedSnapshotPublishRepo: '${{ parameters.packageFeedSnapshotPublishRepo }}'
+      sonarqube: false
+      sonarqubeScannerMode: '${{ parameters.sonarqubeScannerMode }}'
+      sonarqubeProjectKey: '${{ parameters.sonarqubeProjectKey }}'
+      sonarqubeProjectName: '${{ parameters.sonarqubeProjectName }}'
+      sonarqubeProjectVersion: '${{ parameters.sonarqubeProjectVersion }}'
+      sonarqubeServiceConnection: '${{ parameters.sonarqubeServiceConnection }}'
+      sonarqubeExclusions: '${{ parameters.sonarqubeExclusions }}'
+      sonarqubeFailOnError: '${{ parameters.sonarqubeFailOnError }}'
+      sonarqubeExtraProperties: '${{ parameters.sonarqubeExtraProperties }}'
+      insertPreBuildSteps:
+      - bash: |
+          echo "Build.SourceBranch = $(Build.SourceBranch)"
+          echo "branchName = $(branchName)"
+          echo "isRelease = $(isRelease)"
+          echo 'Build.Repository.Uri = $(Build.Repository.Uri)'
+          echo "sonarqubeProjectKey = $(sonarqubeProjectKey)"
+          echo "sonarqubeProjectName = $(sonarqubeProjectName)"
+        displayName: Pre Build - display parameters and variables
+      - bash: |
+          echo "delete maven cache directory $(MAVEN_CACHE_FOLDER)"
+          rm -rf $(MAVEN_CACHE_FOLDER)
+        displayName: Pre Build - delete maven cache
+      insertPostBuildSteps:
+      - ${{ if eq(parameters.ghas_scanning_required, true) }}:
+        - checkout: appsec-ado
+          clean: true
+          path: appsec-ado
+          condition: succeeded()
+      - ${{ if eq(parameters.ghas_scanning_required, true) }}:
+        - template: app-level-exclusions.yml@appsec-ado
+      - ${{ if and(eq(parameters.ghas_scanning_required, true), parameters.ghas_overrideLanguages) }}:
+        - template: codeql_setup.yml@appsec-ado
+          parameters:
+            buildType: 'maven'
+            githubToken: '$(GHAS_Token)'
+            overrideLanguages: '${{ parameters.ghas_overrideLanguages }}'
+      - ${{ if and(eq(parameters.ghas_scanning_required, true), not(parameters.ghas_overrideLanguages)) }}:
+        - template: codeql_setup.yml@appsec-ado
+          parameters:
+            buildType: 'maven'
+            githubToken: '$(GHAS_Token)'
+      - ${{ if eq(parameters.ghas_scanning_required, true) }}:
+        - template: codeql_analyze.yml@appsec-ado
+          parameters:
+            githubToken: '$(GHAS_Token)'
+            buildType: 'maven'
+            pathsIgnore: ${{ parameters.ghas_pathsIgnore }}
+            memory: '5120'
+      - bash: |
+          if [ "$(System.PullRequest.TargetBranch)" != "" ]; then
+            TARGET_BRANCH=$(System.PullRequest.TargetBranch)
+            TARGET_BRANCH=$(echo $TARGET_BRANCH | sed 's#refs/heads/##')
+            echo "PR build detected. Comparing against target branch: $TARGET_BRANCH"
+            git fetch origin $TARGET_BRANCH 2>/dev/null || git fetch origin
+            CHANGES=$(git diff --name-only origin/$TARGET_BRANCH HEAD 2>/dev/null | wc -l)
+          else
+            echo "Regular build. Comparing against HEAD~1"
+            CHANGES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | wc -l)
+          fi
+          if [ "$CHANGES" -eq 0 ]; then
+            echo "No code changes detected - skipping SonarQube scan"
+            echo "##vso[task.setvariable variable=HAS_CODE_CHANGES]false"
+          else
+            echo "Code changes detected ($CHANGES files)"
+            echo "##vso[task.setvariable variable=HAS_CODE_CHANGES]true"
+          fi
+        displayName: 'Detect Code Changes'
+        condition: succeeded()
+      - ${{ if eq(parameters.sonarqube, 'true') }}:
+        - bash: |
+            artifactPomPath=${{ parameters.mavenBuildArtifactCustomPath }}
+            if [ -z "$artifactPomPath" ]; then
+              artifactPomPath=${{ parameters.mavenBuildPomFilePath }}
+              echo "using default path $artifactPomPath"
+            else
+              echo "using custom path $artifactPomPath"
+            fi
+            pomver=`xmllint --xpath '/*[local-name()="project"]/*[local-name()="version"]/text()' $artifactPomPath`
+            echo $pomver
+            echo "##vso[task.setvariable variable=POM_VERSION]$pomver"
+          displayName: 'Get POM Version for Sonarqube'
+          condition: succeeded()
+        - script: |
+            target_branch_name=$(System.PullRequest.TargetBranch)
+            _target_branch_name=`echo $target_branch_name | sed 's$refs/heads/$$'`
+            echo "Target Branch: $_target_branch_name"
+            sonar_newCode_referenceBranch="sonar.newCode.referenceBranch=$_target_branch_name"
+            echo "##vso[task.setvariable variable=SONARQUBE_PR_PROPERTIES]$sonar_newCode_referenceBranch"
+          displayName: Set Target BranchName for Sonarqube
+          condition: eq(variables['Build.Reason'], 'PullRequest')
+        - task: SonarQubePrepare@7
+          displayName: prepare analysis for sonarqube
+          inputs:
+            SonarQube: '${{ parameters.sonarqubeServiceConnection }}'
+            scannerMode: 'CLI'
+            configMode: 'manual'
+            cliProjectKey: '$(sonarqubeProjectKey)'
+            cliProjectName: '$(sonarqubeProjectName)'
+            cliProjectVersion: '$(Build.BuildNumber)'
+            cliSources: '$(System.DefaultWorkingDirectory)'
+            extraProperties: |
+              sonar.projectBaseDir=$(System.DefaultWorkingDirectory)
+              sonar.links.homepage=$(Build.Repository.Uri)
+              sonar.links.ci=$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build?definitionId=$(System.DefinitionId)
+              sonar.links.scm=$(Build.Repository.Uri)
+              ${{ parameters.sonarqubeExtraProperties }}
+              sonar.exclusions='${{ parameters.sonarqubeExclusions }}'
+              sonar.projectVersion=$(POM_VERSION)
+              $(SONARQUBE_PR_PROPERTIES)
+          condition: succeeded()
+        - bash: |
+            cat sonar-project.properties
+            echo
+            echo ******************************************************
+            echo sonar scanner variables:
+            echo "SONARQUBE_SCANNER_PARAMS = $(SONARQUBE_SCANNER_PARAMS)"
+            echo ******************************************************
+          displayName: 'show sonar-project properties'
+          condition: succeeded()
+        - script: echo "Custom cleanup or notification"
+        - task: SonarQubeAnalyze@7
+          displayName: "Run Code Analysis"
+          continueOnError: ${{ parameters.continueOnSonarError }}
+          condition: succeeded()
+        - task: SonarQubePublish@7
+          displayName: publish sonarqube results
+          inputs:
+            pollingTimeoutSec: '480'
+          timeoutInMinutes: 2
+          continueOnError: ${{ parameters.continueOnSonarError }}
+          condition: succeeded()
+        - task: JavaToolInstaller@0
+          displayName: 'Reinstall JDK ${{ parameters.jdkVersion }}'
+          inputs:
+            versionSpec: ${{ parameters.jdkVersion }}
+            jdkArchitectureOption: ${{ parameters.buildJdkArchitecture }}
+            jdkSourceOption: 'PreInstalled'
+          condition: succeeded()
+
+# ── Code Quality stage ───────────────────────────────────────────
+- ${{ if and(not(parameters.skipBuild), ne(variables['Build.Reason'], 'PullRequest')) }}:
+  - stage: Triggering_codeql_reporting
+    displayName: Running code quality report
+    jobs:
+    - job: CodeQualityReporter
+      pool:
+        name: ${{ parameters.agentPoolName }}
+        demands:
+        - agent.os -equals Linux
+      displayName: "Running Code Quality Reporter"
+      steps:
+        - checkout: self
+          clean: true
+        - template: cql-azure-pipeline.yml@codequalityreporter_27437
+          parameters:
+            options: 'QG:WARN'
+
+# ── OCP4 Deploy stage ────────────────────────────────────────────
+- ${{ if and(not(parameters.skipDeploy), ne(variables['Build.Reason'], 'PullRequest'), ne(parameters.deploy_service_name, '')) }}:
+  - stage: OCP4_Deploy
+    jobs:
+    - job: deploy
+      pool:
+        name: ${{ parameters.agentPoolName }}
+        demands:
+        - agent.os -equals Linux
+      variables:
+        - name: ARTIFACT_VER
+        - name: IMAGE_TAG
+        - name: deployArtifactName
+          value: ${{ parameters.deploy_service_name }}
+      steps:
+
+      # ── CHANGE 1: Added name + isOutput=true so IMAGE_TAG
+      #             is available to downstream stages ──────────
+      - bash: |
+          echo 'Create Image Tag'
+          artifactPomPath=${{ parameters.mavenBuildArtifactCustomPath }}
+          if [ -z "$artifactPomPath" ]
+          then
+            artifactPomPath=${{ parameters.mavenBuildPomFilePath }}
+            echo "using default path $artifactPomPath"
+          else
+            echo "using custom path $artifactPomPath"
+          fi
+          pomver=`xmllint --xpath '/*[local-name()="project"]/*[local-name()="version"]/text()' $artifactPomPath`
+          echo $pomver
+          [[ "$pomver" =~ ^[0-9]+\.[0-9]+\.[0-9]+.*$ ]] && echo "pomver looks good" || exit 1
+          if [ "$(isRelease)" = true ]; then
+            echo "##vso[task.setvariable variable=ARTIFACT_VER]${pomver%-SNAPSHOT}"
+          else
+            echo "##vso[task.setvariable variable=ARTIFACT_VER]$pomver"
+          fi
+          relver=${pomver%%-*}
+          relver=${relver%%_*}
+          echo "relver = $relver"
+          commitsha=$(Build.SourceVersion)
+          echo "commitsha = $commitsha"
+          tag="$(Build.BuildId)-$relver-${commitsha:0:7}"
+          echo "tag = $tag"
+          echo "##vso[task.setvariable variable=IMAGE_TAG]$tag"
+          echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$tag"
+        name: CreateImageTag
+        displayName: 'Create Image Tag'
+        failOnStderr: true
+        condition: succeeded()
+
+      - bash: |
+          overrideServiceName=${{ parameters.deploy_artifact_name }}
+          echo $overrideServiceName
+          if [ -z "$overrideServiceName" ]
+          then
+            echo $deployArtifactName
+          else
+            echo "using custom name $overrideServiceName"
+            echo "##vso[task.setvariable variable=deployArtifactName]$overrideServiceName"
+          fi
+        displayName: 'Deploy Service Name'
+        condition: succeeded()
+
+      - bash: |
+          echo "IMAGE_TAG = $(IMAGE_TAG)"
+          echo "ARTIFACT_VER = $(ARTIFACT_VER)"
+          echo "GITHUB_PROXY_URI = $(GITHUB_PROXY_URI)"
+          echo "deployArtifactName = $(deployArtifactName)"
+        displayName: 'Display Variables'
+        condition: succeeded()
+
+      - task: oc-setup@2
+        displayName: 'OC CLI Install and Login'
+        inputs:
+          connectionType: 'OpenShift Connection Service'
+          openshiftService: '${{ parameters.openshiftServiceConnection }}'
+          version: '4.10'
+        condition: succeeded()
+
+      - task: oc-cmd@2
+        displayName: 'Select OCP Namespace'
+        inputs:
+          connectionType: 'OpenShift Connection Service'
+          openshiftService: '${{ parameters.openshiftServiceConnection }}'
+          cmd: 'oc project ${{ parameters.oc_project }}'
+          useLocalOc: true
+        condition: succeeded()
+
+      - task: oc-cmd@2
+        displayName: 'Patch Build Config'
+        condition: and(succeeded(), eq(variables['agentpool'], 'Prod'))
+        inputs:
+          connectionType: 'OpenShift Connection Service'
+          openshiftService: '${{ parameters.openshiftServiceConnection }}'
+          cmd: 'oc patch "bc/${{ parameters.deploy_service_name }}" --type "json" -p ''[{"op": "replace", "path": "/spec/output/to/name", "value": "$(docker-snapshots-repo).artifactory-qa.bmogc.net/${{ parameters.deploy_service_name }}:$(IMAGE_TAG)"},{"op": "replace", "path": "/spec/source/git/httpProxy", "value": ""},{"op": "replace", "path": "/spec/source/git/httpsProxy", "value": ""}]'''
+          useLocalOc: true
+
+      - task: oc-cmd@2
+        displayName: 'Patch Build Config'
+        condition: and(succeeded(), eq(variables['agentpool'], 'Main'))
+        inputs:
+          connectionType: 'OpenShift Connection Service'
+          openshiftService: '${{ parameters.openshiftServiceConnection }}'
+          cmd: 'oc patch "bc/${{ parameters.deploy_service_name }}" --type "json" -p ''[{"op": "replace", "path": "/spec/output/to/name", "value": "bmostaging.jfrog.io/$(docker-snapshots-repo)/${{ parameters.deploy_service_name }}:$(IMAGE_TAG)"},{"op": "replace", "path": "/spec/source/git/httpProxy", "value": ""},{"op": "replace", "path": "/spec/source/git/httpsProxy", "value": ""}]'''
+          useLocalOc: true
+
+      - task: oc-cmd@2
+        displayName: 'Start Build'
+        inputs:
+          connectionType: 'OpenShift Connection Service'
+          openshiftService: '${{ parameters.openshiftServiceConnection }}'
+          cmd: 'oc start-build ${{ parameters.deploy_service_name }}
+            -e ARTIFACTORY_REPO=${{ parameters.packageFeedSnapshotResolveRepo }}
+            -e ARTIFACT_LOCATION=${{ parameters.artifact_location }}
+            -e COMMIT_SHA=$(Build.SourceVersion)
+            -e ARTIFACT_ID=$(deployArtifactName)
+            -e VERSION=$(ARTIFACT_VER)
+            -e ARTIFACT_EXTENSION=${{ parameters.artifact_extension }}
+            -e ARTIFACT_CLASSIFIER=${{ parameters.artifact_classifier }}
+            -e BRANCH=$(Build.SourceBranchName)
+            --wait'
+          useLocalOc: true
+        condition: succeeded()
+
+      - template: utils/servicenow-register-image-container.yml
+        parameters:
+          deploy_service_name: ${{ parameters.deploy_service_name }}
+          image_tag: $(IMAGE_TAG)
+          base_image_name: $(springboot_base_image_name)
+          base_image_version: $(springboot_base_image_version)
+
+      - task: oc-cmd@2
+        displayName: 'Patch Deployment Config'
+        condition: and(succeeded(), eq(variables['agentpool'], 'Prod'))
+        inputs:
+          connectionType: 'OpenShift Connection Service'
+          openshiftService: '${{ parameters.openshiftServiceConnection }}'
+          cmd: 'oc patch "dc/${{ parameters.deploy_service_name }}" -p ''{"spec":{"template":{"spec":{"containers":[{"name":"${{ parameters.deploy_service_name }}","image":"$(docker-snapshots-repo).artifactory-qa.bmogc.net/${{ parameters.deploy_service_name }}:$(IMAGE_TAG)"}]}}}}'
+          useLocalOc: true
+
+      - task: oc-cmd@2
+        displayName: 'Patch Deployment Config'
+        condition: and(succeeded(), eq(variables['agentpool'], 'Main'))
+        inputs:
+          connectionType: 'OpenShift Connection Service'
+          openshiftService: '${{ parameters.openshiftServiceConnection }}'
+          cmd: 'oc patch "dc/${{ parameters.deploy_service_name }}" -p ''{"spec":{"template":{"spec":{"containers":[{"name":"${{ parameters.deploy_service_name }}","image":"bmostaging.jfrog.io/$(docker-snapshots-repo)/${{ parameters.deploy_service_name }}:$(IMAGE_TAG)"}],"imagePullSecrets":[{"name":"artifactory-saas"}]}}}}'
+          useLocalOc: true
+
+      - task: oc-cmd@2
+        displayName: 'oc Log out'
+        inputs:
+          connectionType: 'OpenShift Connection Service'
+          openshiftService: '${{ parameters.openshiftServiceConnection }}'
+          cmd: 'oc logout'
+          useLocalOc: true
+        condition: always()
+
+      - template: utils/publish-buildinfo-artifact.yml
+
+# ── CHANGE 2: Replaced old ArgoCD_Auto_PR stage with new unified
+#             argocd-gitops-deploy.yml template reference.
+#             IMAGE_TAG passed via stageDependencies output. ──────
+- ${{ if and(not(parameters.skipDeploy), ne(variables['Build.Reason'], 'PullRequest'), ne(parameters.deploy_service_name, '')) }}:
+  - stage: ArgoCD_GitOps_Deploy
+    displayName: 'ArgoCD GitOps Deploy'
+    dependsOn: OCP4_Deploy
+    condition: succeeded()
+    variables:
+      # Picks up IMAGE_TAG computed in OCP4_Deploy → deploy job → CreateImageTag step
+      IMAGE_TAG: $[ stageDependencies.OCP4_Deploy.deploy.outputs['CreateImageTag.IMAGE_TAG'] ]
+
+    jobs:
+      - template: pipeline_templates/utils/argocd-gitops-deploy.yml
+        parameters:
+          deploy_service_name: ${{ parameters.deploy_service_name }}
+          imageTag:            $(IMAGE_TAG)
+          agentPoolName:       ${{ parameters.agentPoolName }}
+          argocdRepoName:      ${{ parameters.argocdRepoName }}
+          argocdBaseBranch:    ${{ parameters.argocdBaseBranch }}
+          jiraTicket:          ${{ parameters.jiraTicket }}
+
+# ── Promotion stages (unchanged) ────────────────────────────────
+- ${{ if and(not(parameters.skipDeploy), parameters.enablePromotionSteps, ne(variables['Build.Reason'], 'PullRequest'), ne(parameters.deploy_service_name, '')) }}:
+  - template: utils/promote.yml
+    parameters:
+      release_stage: QA
+      stage_type: Promotion
+      dependsOn: OCP4_Deploy
+      tag_name: ReleaseCandidate
+      oc_project: ${{ parameters.oc_project }}
+      deploy_service_name: ${{ parameters.deploy_service_name }}
+      artifact_type: "maven"
+      source_repo: ${{ parameters.source_repo }}
+      target_repo: ${{ parameters.target_repo }}
+
+  - template: utils/promote.yml
+    parameters:
+      release_stage: PROD
+      stage_type: Promotion
+      dependsOn: QA_Promotion
+      tag_name: Release
+      oc_project: ${{ parameters.oc_project }}
+      deploy_service_name: ${{ parameters.deploy_service_name }}
+      artifact_type: "maven"
+      source_repo: ${{ parameters.source_repo }}
+      target_repo: ${{ parameters.target_repo }}
+
+# - template: promote.yml
+#   parameters:
+#     release_stage: POSTPROD
+#     stage_type: Retrofit
+#     dependsOn: PROD_Promotion
+#     tag_name: Production
+#     oc_project: ${{ parameters.oc_project }}
+#     deploy_service_name: ${{ parameters.deploy_service_name }}
+#     artifact_type: "maven"

@@ -1,0 +1,52 @@
+import json
+import re
+from pathlib import Path
+
+root = Path("/path/to/gitops-argocd-non-prod_15255")
+outfile = Path("Channel_Services_Environment_Matrix.json")
+
+matrix = {}
+service_re = re.compile(r"^(?P<service>.+)-dc\.yaml$")
+
+for dc_path in root.rglob("*-dc.yaml"):
+    try:
+        rel = dc_path.relative_to(root)
+    except ValueError:
+        continue
+
+    parts = rel.parts
+    if len(parts) < 5:
+        continue
+
+    namespace_group = parts[0]
+    app_group = parts[1]
+    env = parts[2]
+    service_dir = parts[3]
+    file_name = parts[-1]
+
+    m = service_re.match(file_name)
+    if not m:
+        continue
+
+    service = m.group("service")
+    if service_dir != service:
+        continue
+
+    entry = matrix.setdefault(service, {
+        "environments": [],
+        "approvers": "",
+        "namespace_group": namespace_group,
+        "app_group": app_group
+    })
+
+    if env not in entry["environments"]:
+        entry["environments"].append(env)
+
+for service, entry in matrix.items():
+    entry["environments"] = sorted(entry["environments"])
+
+with outfile.open("w", encoding="utf-8") as f:
+    json.dump(dict(sorted(matrix.items())), f, indent=2, ensure_ascii=False)
+    f.write("\n")
+
+print(f"Wrote {len(matrix)} services to {outfile}")

@@ -1,0 +1,55 @@
+{
+  "_comment": "Maps each channel service deploy_service_name to its valid GitOps environments.",
+  "_maintained_by": "dss_devops_admins",
+  "_last_updated": "2026-06-04",
+  "_note": "Environment names must match folder names exactly in gitops-argocd-non-prod_15255",
+
+  "channels-ms-cache": {
+    "environments": ["dv1", "qa1", "qa2", "qa3"],
+    "approvers": "aem-team@bmo.com",
+    "namespace_group": "b2c-north-ext",
+    "app_group": "aem-ext-15255"
+  },
+  "channels-ms-email": {
+    "environments": ["dv1", "qa1", "qa4", "qa6"],
+    "approvers": "aem-team@bmo.com",
+    "namespace_group": "b2c-north-ext",
+    "app_group": "aem-ext-15255"
+  },
+  "channels-ms-partyv3": {
+    "environments": ["dv1", "qa1", "qa2"],
+    "approvers": "aem-team@bmo.com",
+    "namespace_group": "b2c-north-ext",
+    "app_group": "aem-ext-15255"
+  },
+  "channels-ms-refdata": {
+    "environments": ["dv1", "qa1", "qa3", "qa6"],
+    "approvers": "aem-team@bmo.com",
+    "namespace_group": "b2c-north-ext",
+    "app_group": "aem-ext-15255"
+  },
+  "channels-ms-wbl": {
+    "environments": ["dv1", "qa1", "qa8"],
+    "approvers": "aem-team@bmo.com",
+    "namespace_group": "b2c-north-ext",
+    "app_group": "aem-ext-15255"
+  },
+  "api-join-prospect": {
+    "environments": ["dv1", "qa1", "qa2", "qa3"],
+    "approvers": "aem-team@bmo.com",
+    "namespace_group": "b2c-north-ext",
+    "app_group": "aem-ext-15255"
+  },
+  "api-branch-profile": {
+    "environments": ["dv1", "qa1", "qa1_blue"],
+    "approvers": "gal-team@bmo.com",
+    "namespace_group": "b2c-north-ext",
+    "app_group": "gal-ext-15255"
+  },
+  "channels-ms-lsso-creditcard-service": {
+    "environments": ["dv1", "qa1", "qa1_blue", "qa1_green", "qa8"],
+    "approvers": "lsso-team@bmo.com",
+    "namespace_group": "b2c-north-ext",
+    "app_group": "lsso-ext-15255"
+  }
+}
