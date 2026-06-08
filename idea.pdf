@@ -1,0 +1,121 @@
+# Automating GitOps Image Tag Deployments
+
+## Purpose
+
+This proposal recommends automating GitOps image tag updates for ArgoCD-managed deployments in the `gitops-argocd-non-prod_15255` repository. The goal is to remove repeated manual work, reduce security exposure, and improve deployment auditability.
+
+## Current Problem
+
+Teams using ArgoCD follow a GitOps model where application image tags are stored in a dedicated GitOps repository. ArgoCD watches that repository and syncs workloads into OpenShift after Git changes are merged.
+
+Today, each image promotion requires a developer to manually complete a six-step process:
+
+1. Clone the GitOps repository locally.
+2. Create a new branch from `master`.
+3. Locate the correct Kustomize patch file (`*-dc.yaml`) for the service and environment.
+4. Edit the `value:` field to update the container image tag.
+5. Commit and push the change, while following the Jira-style commit convention.
+6. Raise a pull request and wait for review and merge.
+
+## Operational Impact
+
+This manual process creates several portfolio-level problems:
+
+| Area | Impact |
+|------|--------|
+| Deployment frequency | Each service deploys across multiple environments such as dv1, qa1-qa8, pf, and pf2. |
+| Time lost | Each deployment can take 15-30 minutes of manual effort per environment. |
+| Security exposure | Developers need direct write access to the GitOps repository. |
+| Audit gaps | Manual PR titles and descriptions are inconsistent and do not reliably link back to the originating Azure DevOps build. |
+| Human error risk | Wrong file updates, wrong tags, or missed environments can delay deployment. |
+
+At scale, this means a single service rollout across ten environments can consume hours of repetitive engineering time.
+
+## Proposed Improvement
+
+The proposed solution is a reusable Azure DevOps pipeline template that automates the full GitOps update workflow after a successful image build.
+
+The pipeline performs the following actions automatically:
+
+1. Authenticates to GitHub using a dedicated service account token stored securely in Azure DevOps.
+2. Clones the GitOps repository.
+3. Identifies the correct `*-dc.yaml` file based on service and environment.
+4. Updates the target image tag.
+5. Creates a branch, commits with a Jira-compliant message, and raises a pull request.
+6. Waits for mergeability checks and automatically merges the PR when rules pass.
+
+## Improvements Added
+
+The updated design is stronger than the original idea because it now includes several production-ready improvements:
+
+### 1. Ruleset-aware automation
+
+The implementation is designed to work with existing GitHub rulesets rather than bypass them.
+
+- Enterprise default branch security posture is respected because the pipeline uses normal PR and squash-merge behavior.
+- Copilot PR review delay is handled with a mergeability polling loop.
+- Jira-style commit rules are handled proactively through structured commit messages.
+- File path restrictions do not conflict with this solution because the automation updates deployment patch files, not restricted agent markdown files.
+
+### 2. Stronger security model
+
+The process removes the need for broad developer write access to the GitOps repository.
+
+- Access is limited to a scoped service account token.
+- Credentials are stored in Azure DevOps variable groups.
+- Repository change rights become centralized and auditable.
+
+### 3. Better auditability
+
+Every automated pull request can be standardized.
+
+- PR title and commit message can include the Jira ticket.
+- PR description can link directly to the Azure DevOps build that produced the image.
+- Change history becomes easier to trace during support and audit reviews.
+
+### 4. Safer repeat execution
+
+The updated workflow supports idempotent reruns.
+
+- If the same image tag is already present, the pipeline can safely skip the update.
+- If an older PR exists for the same promotion branch, it can be detected and replaced.
+- This reduces duplicate pull requests and makes retries safer.
+
+## Tasks Completed or Planned
+
+The following tasks are part of the improved implementation plan:
+
+| Task | Description |
+|------|-------------|
+| Reusable ADO template | Create a shared Azure DevOps YAML template that service pipelines can extend. |
+| GitOps repo automation | Clone, branch, edit, commit, push, and PR creation handled in pipeline steps. |
+| YAML patch discovery | Add logic to locate the correct `*-dc.yaml` file dynamically for each service/environment. |
+| Commit message standardization | Generate Jira-compliant commit titles automatically. |
+| PR automation | Create pull requests with consistent titles, descriptions, and traceability metadata. |
+| Merge automation | Add polling logic to wait for GitHub mergeability and PR checks before auto-merge. |
+| Conflict handling | Detect or close duplicate open PRs for the same target branch when rerunning. |
+| Security hardening | Use a dedicated scoped GitHub token instead of developer personal access. |
+| Pilot rollout | Validate the approach with one service before scaling portfolio-wide. |
+
+## Expected Benefits
+
+If approved, this automation provides clear operational value:
+
+- Reduces manual deployment effort from 15-30 minutes per environment to a pipeline-driven flow.
+- Improves consistency across services and environments.
+- Reduces the chance of human error in GitOps patch updates.
+- Strengthens security by narrowing repository write access.
+- Creates a cleaner audit trail between build, PR, and deployment.
+- Makes GitOps promotion faster without changing the underlying ArgoCD deployment model.
+
+## Recommended Pitch Framing
+
+For leadership discussion, this idea can be positioned as a delivery acceleration and control improvement rather than only a scripting enhancement.
+
+A concise message for management:
+
+> The proposal automates a repetitive GitOps promotion process that currently consumes engineering time, requires elevated repository access, and creates weak auditability. By moving this into a reusable Azure DevOps pipeline template, deployments become faster, safer, and easier to trace across the DSS portfolio.
+
+## Ask
+
+Approval is requested for a pilot rollout using one service, one scoped GitHub service account, and the shared Azure DevOps template. After validation, the same pattern can be scaled to other services with minimal onboarding effort.
