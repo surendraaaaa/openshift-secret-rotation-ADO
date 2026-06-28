@@ -1,0 +1,503 @@
+parameters:
+- name: deploy_service_name
+  type: string
+
+- name: imageTag
+  type: string
+
+- name: agentPoolName
+  type: string
+  default: "Main"
+
+- name: argocdRepowner
+  type: string
+  default: "BMO-Prod"
+
+- name: argocdRepoName
+  type: string
+  default: "gitops-argocd-non-prod_15255"
+
+- name: argocdBaseBranch
+  type: string
+  default: "master"
+
+- name: approverEmails
+  type: string
+  default: "surendrajethabhai.prajapati@bmo.com"
+
+# Optional — leave blank to auto-generate [BUILD-{id}] prefix
+- name: jiraTicket
+  type: string
+  default: ""
+
+stages:
+
+# =============================================================================
+# STAGE 1 — Read matrix JSON and resolve which envs exist for this service
+# =============================================================================
+- stage: Resolve_Environments
+  displayName: "Stage 1 — Discover Environments"
+  jobs:
+
+  - job: ResolveEnvMatrix
+    displayName: "Matrix Lookup"
+    pool:
+      name: ${{ parameters.agentPoolName }}
+      demands:
+        - agent.os -equals Linux
+
+    steps:
+    - checkout: deploymentMatrix
+      clean: true
+      path: s/deployment-matrix
+
+    - task: PythonScript@0
+      name: MatrixLookup
+      displayName: "Lookup Service Environments from Matrix"
+      inputs:
+        scriptSource: inline
+        script: |
+          import json, os, sys
+
+          service = "${{ parameters.deploy_service_name }}"
+
+          matrix_file = os.path.join(
+              os.environ["AGENT_BUILDDIRECTORY"],
+              "deployment-matrix",
+              "Azure-DevOps-Templates",
+              "Deployment-Matrix",
+              "ChannelServices",
+              "Channel_Services_Environment_Matrix.json"
+          )
+
+          if not os.path.isfile(matrix_file):
+              print(f"##vso[task.logissue type=error]Matrix file not found: {matrix_file}")
+              sys.exit(1)
+
+          with open(matrix_file, encoding="utf-8") as f:
+              matrix = json.load(f)
+
+          entry = matrix.get(service)
+          if not entry:
+              print(f"##vso[task.logissue type=warning]Service '{service}' not found in matrix.")
+              print("##vso[task.setvariable variable=resolvedEnvs;isOutput=true]NONE")
+              print("##vso[task.setvariable variable=envMatrix;isOutput=true]{}")
+              sys.exit(0)
+
+          envs = entry.get("environments", [])
+          if not envs:
+              print(f"##vso[task.logissue type=warning]No environments found for '{service}'.")
+              print("##vso[task.setvariable variable=resolvedEnvs;isOutput=true]NONE")
+              print("##vso[task.setvariable variable=envMatrix;isOutput=true]{}")
+              sys.exit(0)
+
+          # Build runtime strategy.matrix — keys must be alphanumeric/underscore only
+          matrix_json = {}
+          for env in sorted(envs):
+              key = f"env_{env.replace('-', '_')}"
+              matrix_json[key] = {"ENV_DIR": env}
+
+          resolved_csv = ",".join(sorted(envs))
+          matrix_str   = json.dumps(matrix_json)
+
+          print(f"Service       : {service}")
+          print(f"Resolved envs : {resolved_csv}")
+          print(f"Matrix JSON   : {matrix_str}")
+
+          print(f"##vso[task.setvariable variable=resolvedEnvs;isOutput=true]{resolved_csv}")
+          print(f"##vso[task.setvariable variable=envMatrix;isOutput=true]{matrix_str}")
+      env:
+        AGENT_BUILDDIRECTORY: $(Agent.BuildDirectory)
+
+# =============================================================================
+# STAGE 2 — Developer selects which resolved environments to deploy
+#            ONLY environments from the matrix appear — no hardcoded list
+# =============================================================================
+- stage: Select_Environments
+  displayName: "Stage 2 — Select Environments to Deploy"
+  dependsOn: Resolve_Environments
+  condition: |
+    and(
+      succeeded(),
+      ne(dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.resolvedEnvs'], 'NONE'),
+      ne(dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.resolvedEnvs'], '')
+    )
+
+  jobs:
+  - job: SelectEnv
+    displayName: "Select — $(ENV_DIR)"
+    pool: server
+    timeoutInMinutes: 10080
+    strategy:
+      matrix: $[ dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.envMatrix'] ]
+
+    steps:
+    - task: ManualValidation@0
+      displayName: "Resume to include $(ENV_DIR) — Reject to skip"
+      timeoutInMinutes: 10080
+      inputs:
+        instructions: |
+          Resume  -> include $(ENV_DIR) in this deployment run
+          Reject  -> skip $(ENV_DIR) (pipeline continues for other envs)
+
+          Service   : ${{ parameters.deploy_service_name }}
+          Env       : $(ENV_DIR)
+          Image Tag : ${{ parameters.imageTag }}
+          Jira      : ${{ parameters.jiraTicket }}
+        onTimeout: reject
+
+# =============================================================================
+# STAGE 3 — Clone GitOps repo, patch dc.yaml, push branch, open PR
+# =============================================================================
+- stage: Update_Manifests
+  displayName: "Stage 3 — Update GitOps Manifests and Raise PRs"
+  dependsOn:
+    - Resolve_Environments
+    - Select_Environments
+  condition: |
+    and(
+      succeeded('Resolve_Environments'),
+      in(dependencies.Select_Environments.result, 'Succeeded', 'SucceededWithIssues')
+    )
+
+  jobs:
+  - job: UpdateManifest
+    displayName: "Update manifest — $(ENV_DIR)"
+    strategy:
+      matrix: $[ dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.envMatrix'] ]
+    pool:
+      name: ${{ parameters.agentPoolName }}
+      demands:
+        - agent.os -equals Linux
+    variables:
+      - group: dss_devops_variables
+
+    steps:
+
+    # ── Step A: Clone, patch dc.yaml, commit, push branch ────────────────────
+    - task: PythonScript@0
+      displayName: "Patch dc.yaml and push branch"
+      inputs:
+        scriptSource: inline
+        script: |
+          import os, re, subprocess, sys, glob
+
+          REPO_OWNER = "${{ parameters.argocdRepowner }}"
+          REPO_NAME  = "${{ parameters.argocdRepoName }}"
+          SERVICE    = "${{ parameters.deploy_service_name }}"
+          IMAGE_TAG  = "${{ parameters.imageTag }}"
+          ENV_DIR    = "$(ENV_DIR)"
+          TOKEN      = os.environ["GITHUB_TOKEN"]
+          BUILD_ID   = os.environ.get("BUILD_BUILDID", "")
+          REPO_DIR   = os.path.join(
+              os.environ.get("AGENT_TEMPDIRECTORY", "/tmp"),
+              f"argocd-{ENV_DIR}-{BUILD_ID}"
+          )
+          BRANCH = f"{SERVICE}-{ENV_DIR}-{BUILD_ID}"
+
+          def run(cmd, cwd=None):
+              res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+              if res.stdout: print(res.stdout)
+              if res.stderr: print(res.stderr)
+              if res.returncode != 0:
+                  sys.exit(res.returncode)
+
+          # Clone repo
+          run(["git", "clone",
+               f"https://x-access-token:{TOKEN}@github.com/{REPO_OWNER}/{REPO_NAME}.git",
+               REPO_DIR])
+          run(["git", "config", "user.email",
+               os.environ.get("BUILD_REQUESTEDFOREMAIL", "devops@bmo.com")], cwd=REPO_DIR)
+          run(["git", "config", "user.name",
+               os.environ.get("BUILD_REQUESTEDFOR", "DevOps Automation")], cwd=REPO_DIR)
+          run(["git", "checkout", "master"], cwd=REPO_DIR)
+          run(["git", "pull", "origin", "master"], cwd=REPO_DIR)
+          run(["git", "checkout", "-b", BRANCH], cwd=REPO_DIR)
+
+          # Discover dc.yaml — pass 1: standard layout
+          matches = glob.glob(
+              os.path.join(REPO_DIR, "**", ENV_DIR, SERVICE, f"{SERVICE}-dc.yaml"),
+              recursive=True
+          )
+          # Pass 2: pf2-style extra nesting (pf/pf2/pf2/service/...)
+          if not matches:
+              matches = glob.glob(
+                  os.path.join(REPO_DIR, "**", ENV_DIR, "**", SERVICE, f"{SERVICE}-dc.yaml"),
+                  recursive=True
+              )
+          if not matches:
+              print(f"##vso[task.logissue type=error]"
+                    f"No dc.yaml found for service='{SERVICE}' env='{ENV_DIR}'")
+              sys.exit(1)
+
+          manifest = matches[0]
+          print(f"Found manifest: {manifest}")
+
+          with open(manifest, encoding="utf-8") as f:
+              original = f.read()
+
+          # Update the image tag value line
+          pattern = rf"(value:\s+\S*{re.escape(SERVICE)}/)\S*"
+          updated, count = re.subn(pattern, rf"\g<1>{IMAGE_TAG}", original)
+
+          if count == 0 or updated == original:
+              print(f"##vso[task.logissue type=error]"
+                    f"Image tag pattern not matched in {manifest}")
+              sys.exit(1)
+
+          with open(manifest, "w", encoding="utf-8") as f:
+              f.write(updated)
+
+          # Jira ticket is optional — fallback to BUILD-{id}
+          jira = os.environ.get("JIRA_TICKET", "").strip()
+          ticket_prefix = f"[{jira}] " if jira else f"[BUILD-{BUILD_ID}] "
+          commit_msg = (
+              f"{ticket_prefix}chore({SERVICE}): "
+              f"update {ENV_DIR} image to {IMAGE_TAG} [skip ci]"
+          )
+
+          run(["git", "add", manifest], cwd=REPO_DIR)
+          run(["git", "commit", "-m", commit_msg, "--allow-empty"], cwd=REPO_DIR)
+          run(["git", "push", "origin", BRANCH], cwd=REPO_DIR)
+          print(f"Branch '{BRANCH}' pushed successfully.")
+      env:
+        GITHUB_TOKEN: $(GITHUB_TOKEN)
+        BUILD_BUILDID: $(Build.BuildId)
+        BUILD_REQUESTEDFOR: $(Build.RequestedFor)
+        BUILD_REQUESTEDFOREMAIL: $(Build.RequestedForEmail)
+        JIRA_TICKET: ${{ parameters.jiraTicket }}
+        AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
+
+    # ── Step B: Open PR (reuse existing open PR if already exists) ────────────
+    - task: PythonScript@0
+      displayName: "Create PR"
+      inputs:
+        scriptSource: inline
+        script: |
+          import json, os, sys, urllib.request, urllib.error
+
+          REPO_OWNER  = "${{ parameters.argocdRepowner }}"
+          REPO_NAME   = "${{ parameters.argocdRepoName }}"
+          SERVICE     = "${{ parameters.deploy_service_name }}"
+          IMAGE_TAG   = "${{ parameters.imageTag }}"
+          ENV_DIR     = "$(ENV_DIR)"
+          BUILD_ID    = os.environ.get("BUILD_BUILDID", "0")
+          HEAD_BRANCH = f"{SERVICE}-{ENV_DIR}-{BUILD_ID}"
+          BASE_BRANCH = "${{ parameters.argocdBaseBranch }}"
+          TOKEN       = os.environ["GITHUB_TOKEN"]
+          JIRA        = os.environ.get("JIRA_TICKET", "").strip()
+          API_BASE    = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
+
+          def gh(method, path, data=None):
+              headers = {
+                  "Authorization": f"Bearer {TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28"
+              }
+              body = json.dumps(data).encode() if data is not None else None
+              req = urllib.request.Request(
+                  f"{API_BASE}{path}", data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return resp.status, json.loads(resp.read())
+              except urllib.error.HTTPError as exc:
+                  try:    return exc.code, json.loads(exc.read())
+                  except: return exc.code, {}
+
+          # Reuse existing open PR if branch already has one
+          _, prs = gh("GET",
+              f"/pulls?head={REPO_OWNER}:{HEAD_BRANCH}&base={BASE_BRANCH}&state=open")
+          pr_number = prs[0]["number"] if isinstance(prs, list) and prs else None
+
+          if pr_number:
+              print(f"Existing open PR #{pr_number} found — reusing.")
+          else:
+              ticket_prefix = f"[{JIRA}] " if JIRA else f"[BUILD-{BUILD_ID}] "
+              title = f"{ticket_prefix}chore({SERVICE}): deploy {IMAGE_TAG} [{ENV_DIR}]"
+              pr_body = (
+                  f"## Automated GitOps update\n\n"
+                  f"| Field | Value |\n"
+                  f"|---|---|\n"
+                  f"| Service | `{SERVICE}` |\n"
+                  f"| Environment | `{ENV_DIR}` |\n"
+                  f"| Image Tag | `{IMAGE_TAG}` |\n"
+                  f"| Build ID | `{BUILD_ID}` |\n"
+                  f"| Jira | `{JIRA if JIRA else 'N/A'}` |\n"
+              )
+              status, resp = gh("POST", "/pulls",
+                  {"title": title, "body": pr_body,
+                   "head": HEAD_BRANCH, "base": BASE_BRANCH})
+              pr_number = resp.get("number")
+              if not pr_number:
+                  print(f"##vso[task.logissue type=error]PR creation failed: {resp}")
+                  sys.exit(1)
+              print(f"PR #{pr_number} created: {resp.get('html_url', '')}")
+
+          print(f"##vso[task.setvariable variable=prNumber;isOutput=true]{pr_number}")
+      env:
+        GITHUB_TOKEN: $(GITHUB_TOKEN)
+        BUILD_BUILDID: $(Build.BuildId)
+        JIRA_TICKET: ${{ parameters.jiraTicket }}
+
+# =============================================================================
+# STAGE 4 — Manual approval before merge
+# =============================================================================
+- stage: Approve_PRs
+  displayName: "Stage 4 — Approve PRs"
+  dependsOn:
+    - Resolve_Environments
+    - Update_Manifests
+  condition: |
+    and(
+      succeeded('Resolve_Environments'),
+      in(dependencies.Update_Manifests.result, 'Succeeded', 'SucceededWithIssues')
+    )
+
+  jobs:
+  - job: ApprovePR
+    displayName: "Approve PR — $(ENV_DIR)"
+    pool: server
+    timeoutInMinutes: 1440
+    strategy:
+      matrix: $[ dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.envMatrix'] ]
+
+    steps:
+    - task: ManualValidation@0
+      displayName: "Approve merge for $(ENV_DIR)"
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: ${{ parameters.approverEmails }}
+        instructions: |
+          A GitOps PR is ready to squash-merge into master for $(ENV_DIR).
+
+          Review the PR on GitHub then click Resume to merge.
+          Click Reject to abort merge for this environment only.
+
+          Service   : ${{ parameters.deploy_service_name }}
+          Env       : $(ENV_DIR)
+          Image Tag : ${{ parameters.imageTag }}
+          Jira      : ${{ parameters.jiraTicket }}
+          PRs URL   : https://github.com/${{ parameters.argocdRepowner }}/${{ parameters.argocdRepoName }}/pulls
+        onTimeout: reject
+
+# =============================================================================
+# STAGE 5 — Auto-merge approved PRs with mergeability polling
+# =============================================================================
+- stage: Merge_PRs
+  displayName: "Stage 5 — Merge PRs"
+  dependsOn:
+    - Resolve_Environments
+    - Approve_PRs
+  condition: |
+    and(
+      succeeded('Resolve_Environments'),
+      in(dependencies.Approve_PRs.result, 'Succeeded', 'SucceededWithIssues')
+    )
+
+  jobs:
+  - job: MergePR
+    displayName: "Merge PR — $(ENV_DIR)"
+    strategy:
+      matrix: $[ dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.envMatrix'] ]
+    pool:
+      name: ${{ parameters.agentPoolName }}
+      demands:
+        - agent.os -equals Linux
+    variables:
+      - group: dss_devops_variables
+
+    steps:
+    - task: PythonScript@0
+      displayName: "Poll mergeability and squash-merge"
+      inputs:
+        scriptSource: inline
+        script: |
+          import json, os, sys, time, urllib.request, urllib.error
+
+          REPO_OWNER  = "${{ parameters.argocdRepowner }}"
+          REPO_NAME   = "${{ parameters.argocdRepoName }}"
+          SERVICE     = "${{ parameters.deploy_service_name }}"
+          IMAGE_TAG   = "${{ parameters.imageTag }}"
+          ENV_DIR     = "$(ENV_DIR)"
+          BUILD_ID    = os.environ.get("BUILD_BUILDID", "")
+          HEAD_BRANCH = f"{SERVICE}-{ENV_DIR}-{BUILD_ID}"
+          BASE_BRANCH = "${{ parameters.argocdBaseBranch }}"
+          JIRA        = "${{ parameters.jiraTicket }}".strip()
+          TOKEN       = os.environ["GITHUB_TOKEN"]
+          API_BASE    = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
+          MAX_RETRIES = 30
+          RETRY_DELAY = 10  # seconds — total max wait = 5 min
+
+          def gh(method, path, data=None):
+              headers = {
+                  "Authorization": f"Bearer {TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28"
+              }
+              body = json.dumps(data).encode() if data is not None else None
+              req = urllib.request.Request(
+                  f"{API_BASE}{path}", data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return resp.status, json.loads(resp.read())
+              except urllib.error.HTTPError as exc:
+                  try:    return exc.code, json.loads(exc.read())
+                  except: return exc.code, {}
+
+          # Find open PR for this branch
+          _, prs = gh("GET",
+              f"/pulls?head={REPO_OWNER}:{HEAD_BRANCH}&base={BASE_BRANCH}&state=open")
+          if not isinstance(prs, list) or not prs:
+              print(f"No open PR for '{HEAD_BRANCH}' — already merged or skipped.")
+              sys.exit(0)
+
+          pr_number = prs[0]["number"]
+          print(f"Found PR #{pr_number} for {ENV_DIR}. Polling mergeability...")
+
+          last_state = "unknown"
+          for attempt in range(1, MAX_RETRIES + 1):
+              _, pr       = gh("GET", f"/pulls/{pr_number}")
+              pr_state    = pr.get("state", "")
+              mergeable   = pr.get("mergeable")
+              merge_state = pr.get("mergeable_state", "unknown")
+              last_state  = merge_state
+
+              print(f"  [{attempt}/{MAX_RETRIES}] state={pr_state} "
+                    f"mergeable={mergeable} mergeable_state={merge_state}")
+
+              if pr_state != "open":
+                  print("PR is no longer open — already merged or closed.")
+                  sys.exit(0)
+              if mergeable is True and merge_state == "clean":
+                  print("PR is mergeable and clean. Proceeding to merge.")
+                  break
+              if merge_state in ("dirty", "blocked"):
+                  print(f"##vso[task.logissue type=error]"
+                        f"PR #{pr_number} is '{merge_state}' and cannot be merged.")
+                  sys.exit(1)
+              time.sleep(RETRY_DELAY)
+          else:
+              print(f"##vso[task.logissue type=error]"
+                    f"PR not mergeable after {MAX_RETRIES} attempts. "
+                    f"Last state: {last_state}")
+              sys.exit(1)
+
+          # Squash-merge
+          ticket_prefix = f"[{JIRA}] " if JIRA else f"[BUILD-{BUILD_ID}] "
+          merge_title   = f"{ticket_prefix}chore({SERVICE}): deploy {IMAGE_TAG} ({ENV_DIR})"
+
+          _, merge = gh("PUT", f"/pulls/{pr_number}/merge",
+              {"merge_method": "squash", "commit_title": merge_title})
+
+          if not merge.get("merged"):
+              print(f"##vso[task.logissue type=error]Merge failed: {merge}")
+              sys.exit(1)
+
+          print(f"PR #{pr_number} squash-merged successfully.")
+          print(f"ArgoCD will detect the change and sync '{ENV_DIR}' to OpenShift shortly.")
+      env:
+        GITHUB_TOKEN: $(GITHUB_TOKEN)
+        BUILD_BUILDID: $(Build.BuildId)
+        JIRA_TICKET: ${{ parameters.jiraTicket }}
