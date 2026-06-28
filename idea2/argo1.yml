@@ -25,7 +25,6 @@ parameters:
   type: string
   default: "surendrajethabhai.prajapati@bmo.com"
 
-# Optional — leave blank to auto-generate [BUILD-{id}] prefix
 - name: jiraTicket
   type: string
   default: ""
@@ -33,19 +32,17 @@ parameters:
 stages:
 
 # =============================================================================
-# STAGE 1 — Read matrix JSON and resolve which envs exist for this service
+# STAGE 1 — Resolve environments from matrix
 # =============================================================================
 - stage: Resolve_Environments
   displayName: "Stage 1 — Discover Environments"
   jobs:
-
   - job: ResolveEnvMatrix
     displayName: "Matrix Lookup"
     pool:
       name: ${{ parameters.agentPoolName }}
       demands:
         - agent.os -equals Linux
-
     steps:
     - checkout: deploymentMatrix
       clean: true
@@ -91,7 +88,7 @@ stages:
               print("##vso[task.setvariable variable=envMatrix;isOutput=true]{}")
               sys.exit(0)
 
-          # ADO runtime matrix keys — alphanumeric + underscore only
+          # ADO runtime matrix keys must be alphanumeric + underscore only
           matrix_json = {}
           for env in sorted(envs):
               key = f"env_{env.replace('-', '_')}"
@@ -110,14 +107,11 @@ stages:
         AGENT_BUILDDIRECTORY: $(Agent.BuildDirectory)
 
 # =============================================================================
-# STAGE 2 — Select, Deploy, Approve, Merge — all on agent pool (NOT server)
-#
-# KEY FIX: ManualValidation@1 works on agent pool jobs.
-#          Runtime matrix $[ ] only expands on agent pool jobs.
-#          Server pool jobs render $(ENV_DIR) literally — that bug is gone.
+# STAGE 2 — Select: server pool + ManualValidation@0 (only valid combination)
+#            One gate per env in parallel — dev resumes or rejects each
 # =============================================================================
-- stage: Deploy_To_Envs
-  displayName: "Stage 2 — Select, Deploy, Approve and Merge"
+- stage: Select_Envs
+  displayName: "Stage 2 — Select Environments"
   dependsOn: Resolve_Environments
   condition: |
     and(
@@ -125,28 +119,21 @@ stages:
       ne(dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.resolvedEnvs'], 'NONE'),
       ne(dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.resolvedEnvs'], '')
     )
-
   jobs:
-
-  # ── JOB A: Dev selects which envs to deploy (runs in parallel per env) ────
   - job: SelectEnv
-    displayName: "Select — $(ENV_DIR)"
-    pool:
-      name: ${{ parameters.agentPoolName }}
-      demands:
-        - agent.os -equals Linux
+    displayName: "Select"
+    pool: server
     timeoutInMinutes: 10080
     strategy:
       matrix: $[ dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.envMatrix'] ]
-
     steps:
-    - task: ManualValidation@1
-      displayName: "Resume to deploy $(ENV_DIR) — Reject to skip"
+    - task: ManualValidation@0
+      displayName: "Resume to deploy — Reject to skip"
       timeoutInMinutes: 10080
       inputs:
         instructions: |
-          Resume  -> include $(ENV_DIR) in this deployment
-          Reject  -> skip $(ENV_DIR) and continue other envs
+          Resume -> deploy $(ENV_DIR)
+          Reject -> skip $(ENV_DIR) and continue other envs
 
           Service   : ${{ parameters.deploy_service_name }}
           Env       : $(ENV_DIR)
@@ -154,15 +141,22 @@ stages:
           Jira      : ${{ parameters.jiraTicket }}
         onTimeout: reject
 
-  # ── JOB B: Patch dc.yaml, push branch, create PR ─────────────────────────
+# =============================================================================
+# STAGE 3 — Deploy: agent pool — patches dc.yaml, pushes branch, creates PR
+# =============================================================================
+- stage: Deploy_Envs
+  displayName: "Stage 3 — Update Manifests and Raise PRs"
+  dependsOn:
+    - Resolve_Environments
+    - Select_Envs
+  condition: |
+    and(
+      succeeded('Resolve_Environments'),
+      in(dependencies.Select_Envs.result, 'Succeeded', 'SucceededWithIssues')
+    )
+  jobs:
   - job: DeployEnv
     displayName: "Deploy — $(ENV_DIR)"
-    dependsOn: SelectEnv
-    condition: |
-      and(
-        succeeded(),
-        in(dependencies.SelectEnv.result, 'Succeeded', 'SucceededWithIssues')
-      )
     pool:
       name: ${{ parameters.agentPoolName }}
       demands:
@@ -333,51 +327,63 @@ stages:
         BUILD_BUILDID: $(Build.BuildId)
         JIRA_TICKET: ${{ parameters.jiraTicket }}
 
-  # ── JOB C: Approver reviews PR on GitHub then clicks Resume ───────────────
+# =============================================================================
+# STAGE 4 — Approve: server pool + ManualValidation@0 (only valid combination)
+#            Approver reviews PR on GitHub then clicks Resume to merge
+# =============================================================================
+- stage: Approve_Envs
+  displayName: "Stage 4 — Approve PRs"
+  dependsOn:
+    - Resolve_Environments
+    - Deploy_Envs
+  condition: |
+    and(
+      succeeded('Resolve_Environments'),
+      in(dependencies.Deploy_Envs.result, 'Succeeded', 'SucceededWithIssues')
+    )
+  jobs:
   - job: ApproveEnv
-    displayName: "Approve — $(ENV_DIR)"
-    dependsOn: DeployEnv
-    condition: |
-      and(
-        succeeded(),
-        in(dependencies.DeployEnv.result, 'Succeeded', 'SucceededWithIssues')
-      )
-    pool:
-      name: ${{ parameters.agentPoolName }}
-      demands:
-        - agent.os -equals Linux
+    displayName: "Approve PR"
+    pool: server
     timeoutInMinutes: 1440
     strategy:
       matrix: $[ dependencies.Resolve_Environments.outputs['ResolveEnvMatrix.MatrixLookup.envMatrix'] ]
-
     steps:
-    - task: ManualValidation@1
-      displayName: "Approve merge for $(ENV_DIR)"
+    - task: ManualValidation@0
+      displayName: "Approve — Review PR then Resume to merge"
       timeoutInMinutes: 1440
       inputs:
         notifyUsers: ${{ parameters.approverEmails }}
         instructions: |
-          A GitOps PR is ready to squash-merge into master for $(ENV_DIR).
+          GitOps PR is ready to squash-merge into master for $(ENV_DIR).
 
-          Review the PR on GitHub then click Resume to merge.
-          Click Reject to abort merge for this environment only.
+          1. Open PR link below and review the dc.yaml change
+          2. Click Resume here to squash-merge into master
+          3. Click Reject to abort this environment only
 
-          Service   : ${{ parameters.deploy_service_name }}
-          Env       : $(ENV_DIR)
-          Image Tag : ${{ parameters.imageTag }}
-          Jira      : ${{ parameters.jiraTicket }}
-          PRs URL   : https://github.com/${{ parameters.argocdRepowner }}/${{ parameters.argocdRepoName }}/pulls
+          Service  : ${{ parameters.deploy_service_name }}
+          Env      : $(ENV_DIR)
+          ImageTag : ${{ parameters.imageTag }}
+          Jira     : ${{ parameters.jiraTicket }}
+          PRs URL  : https://github.com/${{ parameters.argocdRepowner }}/${{ parameters.argocdRepoName }}/pulls
         onTimeout: reject
 
-  # ── JOB D: Poll GitHub mergeability then squash-merge ─────────────────────
+# =============================================================================
+# STAGE 5 — Merge: agent pool — polls mergeability and squash-merges
+# =============================================================================
+- stage: Merge_Envs
+  displayName: "Stage 5 — Merge PRs"
+  dependsOn:
+    - Resolve_Environments
+    - Approve_Envs
+  condition: |
+    and(
+      succeeded('Resolve_Environments'),
+      in(dependencies.Approve_Envs.result, 'Succeeded', 'SucceededWithIssues')
+    )
+  jobs:
   - job: MergeEnv
     displayName: "Merge — $(ENV_DIR)"
-    dependsOn: ApproveEnv
-    condition: |
-      and(
-        succeeded(),
-        in(dependencies.ApproveEnv.result, 'Succeeded', 'SucceededWithIssues')
-      )
     pool:
       name: ${{ parameters.agentPoolName }}
       demands:
@@ -408,7 +414,7 @@ stages:
           TOKEN       = os.environ["GITHUB_TOKEN"]
           API_BASE    = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
           MAX_RETRIES = 30
-          RETRY_DELAY = 10  # seconds — total max wait = 5 min
+          RETRY_DELAY = 10  # seconds — total max wait ~5 min
 
           def gh(method, path, data=None):
               headers = {
@@ -446,10 +452,10 @@ stages:
               print(f"  [{attempt}/{MAX_RETRIES}] state={pr_state} "
                     f"mergeable={mergeable} mergeable_state={merge_state}")
               if pr_state != "open":
-                  print("PR is no longer open.")
+                  print("PR no longer open.")
                   sys.exit(0)
               if mergeable is True and merge_state == "clean":
-                  print("PR is clean. Merging.")
+                  print("PR is clean. Merging now.")
                   break
               if merge_state in ("dirty", "blocked"):
                   print(f"##vso[task.logissue type=error]"
